@@ -28,25 +28,63 @@ impl TryFrom<u8> for DescriptorType {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(feature="defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Descriptor<'d> {
     DeviceDescriptor(&'d DeviceDescriptor),
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(feature="defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ParsingError {
-    IncompleteDeviceDescriptor{max_packet_size: u8},
-    Incomplete{bytes_needed: usize},
+    IncompleteDeviceDescriptor { max_packet_size: u8 },
+    Incomplete,
     UnknownType(u8),
 }
 
-pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError>{
-    Ok(Descriptor::DeviceDescriptor(unsafe { core::mem::transmute(buf.as_ptr()) }))
+pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError> {
+    if buf.len() < core::mem::size_of::<DeviceDescriptor>() {
+        return Err(ParsingError::Incomplete);
+    }
+    // SAFETY: [`DescriptorHeader`] is packed, does not require alignment,
+    // size is checked above
+    let header: &DescriptorHeader = unsafe { core::mem::transmute(buf.as_ptr()) };
+    let desc_type = DescriptorType::try_from(header.descriptor_type)
+        .map_err(|_| ParsingError::UnknownType(header.descriptor_type))?;
+    match desc_type {
+        DescriptorType::Device => {
+            if buf.len()
+                < core::mem::offset_of!(DeviceDescriptor, max_packet_size)
+                    + core::mem::size_of::<u8>()
+            {
+                Err(ParsingError::Incomplete)
+            } else {
+                // SAFETY: the transmute itself is unsafe. But in the `if` branch
+                // we are guaranteed that DeviceDescriptor::max_packet_size is at least
+                // within bound, because of the above check.
+                // In the else branch we know that the buffer is large enough
+                unsafe {
+                    let dev_desc: &'a DeviceDescriptor = core::mem::transmute(buf.as_ptr());
+                    if buf.len() < header.length as usize {
+                        Err(ParsingError::IncompleteDeviceDescriptor {
+                            max_packet_size: dev_desc.max_packet_size,
+                        })
+                    } else {
+                        Ok(Descriptor::DeviceDescriptor(dev_desc))
+                    }
+                }
+            }
+        }
+        DescriptorType::Configuration => panic!(),
+        DescriptorType::String => panic!(),
+        DescriptorType::Interface => panic!(),
+        DescriptorType::Endpoint => panic!(),
+    }
 }
 
 #[repr(C, packed)]
 struct DescriptorHeader {
+    length: u8,
+    descriptor_type: u8,
 }
 
 /// A device descriptor describes general information about a USB device. It includes information that applies
@@ -55,6 +93,8 @@ struct DescriptorHeader {
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[repr(C, packed)]
 pub struct DeviceDescriptor {
+    pub length: u8,
+    pub descriptor_type: DescriptorType,
     /// USB Specification Release Number in Binary-Coded Decimal (i.e., 2.10 is 210H).
     ///
     /// This field identifies the release of the USB Specification with which the device and its descriptors are compliant.
@@ -216,7 +256,7 @@ pub struct ConfigurationDescriptor {
     pub max_power: u8,
 }
 
-#[cfg(feature="defmt")]
+#[cfg(feature = "defmt")]
 impl defmt::Format for ConfigurationDescriptor {
     fn format(&self, f: defmt::Formatter) {
         defmt::write!(
