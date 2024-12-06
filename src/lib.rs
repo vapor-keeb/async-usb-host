@@ -3,6 +3,8 @@ use core::marker::PhantomData;
 
 use errors::UsbHostError;
 
+pub mod descriptor;
+pub mod types;
 pub mod errors;
 mod macros;
 pub mod pid;
