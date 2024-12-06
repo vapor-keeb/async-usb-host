@@ -4,10 +4,9 @@ use core::marker::PhantomData;
 use errors::UsbHostError;
 
 pub mod descriptor;
-pub mod types;
 pub mod errors;
 mod macros;
-pub mod pid;
+pub mod types;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Event {
@@ -17,6 +16,8 @@ pub enum Event {
     Resume,
 }
 
+// not Send anyways
+#[allow(async_fn_in_trait)]
 pub trait Bus {
     async fn reset(&mut self);
     async fn poll(&mut self) -> Event;
