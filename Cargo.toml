@@ -1,0 +1,11 @@
+[package]
+name = "async-usb-host"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+defmt = { version = "0.3.8", optional = true }
+
+[features]
+defmt = ["dep:defmt"]
