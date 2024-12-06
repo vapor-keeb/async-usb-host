@@ -35,24 +35,28 @@ pub enum Descriptor<'d> {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub enum ParsingError {
     IncompleteDeviceDescriptor { max_packet_size: u8 },
     Incomplete,
+    InvalidLength,
     UnknownType(u8),
 }
 
 pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError> {
-    if buf.len() < core::mem::size_of::<DeviceDescriptor>() {
+    if buf.len() < core::mem::size_of::<DescriptorHeader>() {
         return Err(ParsingError::Incomplete);
     }
     // SAFETY: [`DescriptorHeader`] is packed, does not require alignment,
     // size is checked above
-    let header: &DescriptorHeader = unsafe { core::mem::transmute(buf.as_ptr()) };
+    let header: &'a DescriptorHeader = unsafe { core::mem::transmute(buf.as_ptr()) };
     let desc_type = DescriptorType::try_from(header.descriptor_type)
         .map_err(|_| ParsingError::UnknownType(header.descriptor_type))?;
     match desc_type {
         DescriptorType::Device => {
-            if buf.len()
+            if header.length as usize != core::mem::size_of::<DeviceDescriptor>() {
+                Err(ParsingError::InvalidLength)
+            } else if buf.len()
                 < core::mem::offset_of!(DeviceDescriptor, max_packet_size)
                     + core::mem::size_of::<u8>()
             {
@@ -69,6 +73,9 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
                             max_packet_size: dev_desc.max_packet_size,
                         })
                     } else {
+                        debug_assert!(
+                            header.length as usize == core::mem::size_of::<DeviceDescriptor>()
+                        );
                         Ok(Descriptor::DeviceDescriptor(dev_desc))
                     }
                 }

@@ -1,6 +1,7 @@
 #![no_std]
 use core::marker::PhantomData;
 
+use descriptor::{parse_descriptor, DeviceDescriptor};
 use errors::UsbHostError;
 
 pub mod descriptor;
@@ -49,6 +50,33 @@ impl<D: Driver> Host<D> {
 }
 
 impl<D: Driver> Host<D> {
+    async fn get_device_descriptor<'a, 'b>(buf: &'a mut [u8; 18]) -> Result<&'b DeviceDescriptor, UsbHostError> where 'a : 'b {
+        let mut bytes_read = 0usize;
+        loop {
+                    // let in_result = self.bus.data_in(buf).await?;
+                    buf[0] = 1u8;
+
+                    // bytes_read += in_result;
+
+                    let parse_result = parse_descriptor(&buf[..bytes_read]);
+                    match &parse_result {
+                        Ok(desc) => {
+                            match desc {
+                                descriptor::Descriptor::DeviceDescriptor(desc) => return Ok(desc),
+                            }
+                        },
+                        Err(descriptor::ParsingError::IncompleteDeviceDescriptor {
+                            max_packet_size,
+                        }) => {
+
+                        },
+                        Err(e) => todo!(),
+                    }
+                    drop(parse_result);
+
+        }
+    }
+
     pub async fn run(mut self) {
         loop {
             let event = self.bus.poll().await;
@@ -58,7 +86,6 @@ impl<D: Driver> Host<D> {
                     let buf = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00];
                     unwrap!(self.bus.setup(&buf).await);
                     let mut buffer: [u8; 18] = [0u8; 18];
-                    let in_result = self.bus.data_in(&mut buffer).await;
                     trace!("res: {} & {:x}", in_result, buffer);
                 }
                 Event::DeviceDetach => {}
