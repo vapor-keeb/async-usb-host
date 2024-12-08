@@ -50,31 +50,29 @@ impl<D: Driver> Host<D> {
 }
 
 impl<D: Driver> Host<D> {
-    async fn get_device_descriptor<'a, 'b>(buf: &'a mut [u8; 18]) -> Result<&'b DeviceDescriptor, UsbHostError> where 'a : 'b {
+    async fn get_device_descriptor<'a>(
+        &mut self,
+        buf: &'a mut [u8; 18],
+    ) -> Result<&'a DeviceDescriptor, UsbHostError> {
         let mut bytes_read = 0usize;
-        loop {
-                    // let in_result = self.bus.data_in(buf).await?;
-                    buf[0] = 1u8;
+        let in_result = self.bus.data_in(buf).await?;
+        bytes_read += in_result;
 
-                    // bytes_read += in_result;
+        match parse_descriptor(&buf[..bytes_read]) {
+            Ok(desc) => match desc {
+                descriptor::Descriptor::DeviceDescriptor(desc) => {
 
-                    let parse_result = parse_descriptor(&buf[..bytes_read]);
-                    match &parse_result {
-                        Ok(desc) => {
-                            match desc {
-                                descriptor::Descriptor::DeviceDescriptor(desc) => return Ok(desc),
-                            }
-                        },
-                        Err(descriptor::ParsingError::IncompleteDeviceDescriptor {
-                            max_packet_size,
-                        }) => {
+                },
+            },
+            Err(descriptor::ParsingError::IncompleteDeviceDescriptor { max_packet_size }) => {
 
-                        },
-                        Err(e) => todo!(),
-                    }
-                    drop(parse_result);
-
+            }
+            Err(e) => todo!(),
         }
+
+        let in_result = self.bus.data_in(buf).await?;
+
+        todo!()
     }
 
     pub async fn run(mut self) {
