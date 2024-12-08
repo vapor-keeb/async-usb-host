@@ -1,5 +1,5 @@
 #![no_std]
-use core::marker::PhantomData;
+use core::{borrow::Borrow, marker::PhantomData};
 
 use descriptor::{parse_descriptor, DeviceDescriptor};
 use errors::UsbHostError;
@@ -61,16 +61,22 @@ impl<D: Driver> Host<D> {
         match parse_descriptor(&buf[..bytes_read]) {
             Ok(desc) => match desc {
                 descriptor::Descriptor::DeviceDescriptor(desc) => {
-
-                },
+                    return Ok(desc);
+                }
             },
-            Err(descriptor::ParsingError::IncompleteDeviceDescriptor { max_packet_size }) => {
-
-            }
+            Err(descriptor::ParsingError::IncompleteDeviceDescriptor { max_packet_size }) => {}
             Err(e) => todo!(),
         }
 
-        let in_result = self.bus.data_in(buf).await?;
+        // SAFETY: This is sane as long as core::slice::as_slice implemntation is 
+        // equal to core::slice::as_mut_slice. Which I can not foresee why it 
+        // would ever change. 
+        // Otherwise, since the buf is mut already, and the above immutable borrow
+        // must've been release, otherwise this code is unreachable (see above return).
+        let in_result = self
+            .bus
+            .data_in(unsafe { core::mem::transmute(buf.as_slice()) })
+            .await?;
 
         todo!()
     }
