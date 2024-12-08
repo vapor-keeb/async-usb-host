@@ -58,27 +58,47 @@ impl<D: Driver> Host<D> {
         let in_result = self.bus.data_in(buf).await?;
         bytes_read += in_result;
 
-        match parse_descriptor(&buf[..bytes_read]) {
+        let max_packet_size = match parse_descriptor(&buf[..bytes_read]) {
             Ok(desc) => match desc {
                 descriptor::Descriptor::DeviceDescriptor(desc) => {
                     return Ok(desc);
                 }
             },
-            Err(descriptor::ParsingError::IncompleteDeviceDescriptor { max_packet_size }) => {}
-            Err(e) => todo!(),
+            Err(descriptor::ParsingError::IncompleteDeviceDescriptor { max_packet_size }) => {
+                max_packet_size
+            }
+            Err(e) => return Err(UsbHostError::ParsingError(e)),
+        };
+
+        debug_assert!(max_packet_size % 8 == 0);
+
+        while bytes_read < 18 {
+            let chopped_off_buf = &buf[bytes_read..];
+            // SAFETY:
+            // If the return Ok(desc); statement within the match block was executed,
+            // the borrow is no longer in effect. Therefore, the unsafe transmute
+            // is safe because there are no other outstanding immutable borrows of
+            // the memory region being modified.
+            let in_result = self
+                .bus
+                .data_in(unsafe {
+                    core::slice::from_raw_parts_mut(
+                        chopped_off_buf.as_ptr() as *mut u8,
+                        chopped_off_buf.len(),
+                    )
+                })
+                .await?;
+            bytes_read += in_result;
         }
 
-        // SAFETY: This is sane as long as core::slice::as_slice implemntation is 
-        // equal to core::slice::as_mut_slice. Which I can not foresee why it 
-        // would ever change. 
-        // Otherwise, since the buf is mut already, and the above immutable borrow
-        // must've been release, otherwise this code is unreachable (see above return).
-        let in_result = self
-            .bus
-            .data_in(unsafe { core::mem::transmute(buf.as_slice()) })
-            .await?;
+        debug_assert!(bytes_read == 18);
 
-        todo!()
+        match parse_descriptor(buf) {
+            Ok(desc) => match desc {
+                descriptor::Descriptor::DeviceDescriptor(desc) => Ok(desc),
+            },
+            Err(e) => Err(UsbHostError::ParsingError(e)),
+        }
     }
 
     pub async fn run(mut self) {
@@ -90,7 +110,16 @@ impl<D: Driver> Host<D> {
                     let buf = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x40, 0x00];
                     unwrap!(self.bus.setup(&buf).await);
                     let mut buffer: [u8; 18] = [0u8; 18];
-                    trace!("res: {} & {:x}", in_result, buffer);
+                    match self.get_device_descriptor(&mut buffer).await {
+                        Ok(d) => {
+                            trace!("res: {}", d);
+                        }
+                        Err(e) => debug!("{}", e),
+                    }
+                    match self.bus.data_out(&[]).await {
+                        Ok(_) => {}
+                        Err(e) => debug!("{}", e),
+                    }
                 }
                 Event::DeviceDetach => {}
                 Event::Suspend => {}
