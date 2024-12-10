@@ -30,7 +30,8 @@ impl TryFrom<u8> for DescriptorType {
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Descriptor<'d> {
-    DeviceDescriptor(&'d DeviceDescriptor),
+    Device(&'d DeviceDescriptor),
+    Configuration(&'d ConfigurationDescriptor),
 }
 
 #[derive(Clone, Copy)]
@@ -76,12 +77,20 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
                         debug_assert!(
                             header.length as usize == core::mem::size_of::<DeviceDescriptor>()
                         );
-                        Ok(Descriptor::DeviceDescriptor(dev_desc))
+                        Ok(Descriptor::Device(dev_desc))
                     }
                 }
             }
         }
-        DescriptorType::Configuration => panic!(),
+        DescriptorType::Configuration => {
+            if buf.len() < core::mem::size_of::<ConfigurationDescriptor>() {
+                Err(ParsingError::Incomplete)
+            } else {
+                Ok(Descriptor::Configuration(unsafe {
+                    core::mem::transmute(buf.as_ptr())
+                }))
+            }
+        }
         DescriptorType::String => panic!(),
         DescriptorType::Interface => panic!(),
         DescriptorType::Endpoint => panic!(),
@@ -239,6 +248,8 @@ impl defmt::Format for ConfigurationAttributes {
 #[derive(Clone)]
 #[repr(C, packed)]
 pub struct ConfigurationDescriptor {
+    pub length: u8,
+    pub descriptor_type: DescriptorType,
     /// Total length of data returned for this configuration.
     ///
     /// Includes the combined length of all descriptors (configuration, interface,
