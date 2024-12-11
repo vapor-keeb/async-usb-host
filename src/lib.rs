@@ -24,7 +24,11 @@ pub enum Event {
 pub trait Bus {
     async fn reset(&mut self);
     async fn poll(&mut self) -> Event;
+}
 
+// not Send anyways
+#[allow(async_fn_in_trait)]
+pub trait Pipe {
     fn set_addr(&mut self, addr: u8);
     /// When setup is called, it should send a setup request, also setup the
     /// hardware to send / expect DATA1 packets on subsequent data_in / data_out
@@ -35,38 +39,39 @@ pub trait Bus {
 
 pub trait Driver {
     type Bus: Bus;
+    type Pipe: Pipe;
 
-    fn start(self) -> Self::Bus;
+    fn start(self) -> (Self::Bus, Self::Pipe);
 }
 
 pub struct Host<D: Driver> {
     phantom: PhantomData<D>,
-    bus: D::Bus,
-    next_address: u8,
+    bus: BusWrap<D>,
+    pipe: PipeWrap<D>,
+    address_alloc: DeviceAddressAllocator,
 }
 
 impl<D: Driver> Host<D> {
     pub fn new(driver: D) -> Self {
-        let bus = driver.start();
+        let (bus, pipe) = driver.start();
 
         Host {
-            bus,
-            next_address: 1,
+            bus: BusWrap(bus),
+            pipe: PipeWrap(pipe),
+            address_alloc: DeviceAddressAllocator(1),
             phantom: PhantomData,
         }
     }
 }
 
-impl<D: Driver> Host<D> {
+struct PipeWrap<D: Driver>(D::Pipe);
+
+impl<D: Driver> PipeWrap<D> {
     async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
-        self.bus.setup(unsafe { transmute(req) }).await
+        self.0.setup(unsafe { transmute(req) }).await
     }
 
-    async fn assign_device_address(&mut self) -> Result<u8, UsbHostError> {
-        let addr = self.next_address;
-        assert!(addr <= 127, "out of addr");
-        self.next_address += 1;
-
+    async fn assign_device_address(&mut self, addr: u8) -> Result<(), UsbHostError> {
         let request = Request {
             request_type: {
                 use request::*;
@@ -84,9 +89,9 @@ impl<D: Driver> Host<D> {
         // Setup stage
         self.setup(&request).await?;
         // Status stage (no data)
-        self.bus.data_in(&mut []).await?;
+        self.0.data_in(&mut []).await?;
 
-        Ok(addr)
+        Ok(())
     }
 
     async fn get_device_descriptor<'a>(
@@ -112,7 +117,7 @@ impl<D: Driver> Host<D> {
 
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = self.bus.data_in(buf).await?;
+        let in_result = self.0.data_in(buf).await?;
         bytes_read += in_result;
 
         let max_packet_size = match parse_descriptor(&buf[..bytes_read]) {
@@ -138,7 +143,7 @@ impl<D: Driver> Host<D> {
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
             let in_result = self
-                .bus
+                .0
                 .data_in(unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
@@ -150,7 +155,7 @@ impl<D: Driver> Host<D> {
         }
 
         // Status stage
-        self.bus.data_out(&[]).await?;
+        self.0.data_out(&[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         match parse_descriptor(buf) {
@@ -185,7 +190,7 @@ impl<D: Driver> Host<D> {
             match dir {
                 RequestTypeDirection::HostToDevice => todo!(),
                 RequestTypeDirection::DeviceToHost => loop {
-                    let len = self.bus.data_in(&mut buffer[bytes_received..]).await?;
+                    let len = self.0.data_in(&mut buffer[bytes_received..]).await?;
                     bytes_received += len;
                     if len < max_packet_size as usize {
                         break;
@@ -197,37 +202,61 @@ impl<D: Driver> Host<D> {
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                self.bus.data_in(&mut []).await?;
+                self.0.data_in(&mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                self.bus.data_out(&[]).await?;
+                self.0.data_out(&[]).await?;
             }
         }
 
         Ok(bytes_received)
     }
+}
 
+struct BusWrap<D: Driver>(D::Bus);
+
+struct DeviceAddressAllocator(u8);
+
+impl DeviceAddressAllocator {
+    fn alloc_device_address(&mut self) -> u8 {
+        let addr = self.0;
+        // TODO allocate and free addresses properly
+        assert!(addr <= 127, "out of addr");
+        self.0 += 1;
+        return addr;
+    }
+}
+
+impl<D: Driver> Host<D> {
     pub async fn run(mut self) {
+        let Host {
+            phantom: _,
+            mut bus,
+            mut pipe,
+            mut address_alloc,
+        } = self;
         loop {
-            let event = self.bus.poll().await;
+            let event = bus.0.poll().await;
             info!("event: {}", event);
             match event {
                 Event::DeviceAttach => {
-                    self.bus.reset().await;
-                    #[cfg(feature="embassy")]
+                    bus.0.reset().await;
+                    #[cfg(feature = "embassy")]
                     embassy_time::Timer::after_millis(500).await;
                     let mut buffer: [u8; 18] = [0u8; 18];
-                    match self.get_device_descriptor(&mut buffer).await {
+                    match pipe.get_device_descriptor(&mut buffer).await {
                         Ok(d) => {
                             let max_packet_size = d.max_packet_size;
+                            let addr = address_alloc.alloc_device_address();
                             trace!("DeviceDescriptor: {}", d);
-                            match self.assign_device_address().await {
-                                Ok(addr) => {
+
+                            match pipe.assign_device_address(addr).await {
+                                Ok(_) => {
                                     trace!("Device addressed {}", addr);
-                                    self.bus.set_addr(addr);
+                                    pipe.0.set_addr(addr);
                                     let mut buf: [u8; 255] = [0; 255];
                                     let len = unwrap!(
-                                        self.control_transfer(
+                                        pipe.control_transfer(
                                             &Request::get_configuration_descriptor(
                                                 0,
                                                 core::mem::size_of::<ConfigurationDescriptor>()
@@ -241,7 +270,7 @@ impl<D: Driver> Host<D> {
                                     let cfg = parse_descriptor(&buf[..len]);
                                     trace!("configuration recv {} bytes: {:?}", len, cfg);
                                     unwrap!(
-                                        self.control_transfer(
+                                        pipe.control_transfer(
                                             &Request::set_configuration(1),
                                             &mut [],
                                             max_packet_size
