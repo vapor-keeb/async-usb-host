@@ -2,6 +2,7 @@
 use core::{marker::PhantomData, mem::transmute};
 
 use descriptor::{parse_descriptor, ConfigurationDescriptor, DeviceDescriptor};
+use embassy_futures::select::{select, Either};
 use errors::UsbHostError;
 use request::{Request, StandardDeviceRequest};
 
@@ -44,6 +45,13 @@ pub trait Driver {
     fn start(self) -> (Self::Bus, Self::Pipe);
 }
 
+pub enum HostState {
+    Idle,
+    DeviceEnumerate,
+    DeviceAttached(DeviceHandle),
+    Suspended,
+}
+
 pub struct Host<D: Driver> {
     phantom: PhantomData<D>,
     bus: BusWrap<D>,
@@ -62,6 +70,10 @@ impl<D: Driver> Host<D> {
             phantom: PhantomData,
         }
     }
+}
+
+pub struct DeviceHandle {
+    address: u8,
 }
 
 struct PipeWrap<D: Driver>(D::Pipe);
@@ -114,6 +126,7 @@ impl<D: Driver> PipeWrap<D> {
             length: 64,
         };
         self.setup(&request).await?;
+        trace!("setup finished");
 
         // Data stage
         let mut bytes_read = 0usize;
@@ -211,6 +224,38 @@ impl<D: Driver> PipeWrap<D> {
 
         Ok(bytes_received)
     }
+
+    async fn dev_attach(
+        &mut self,
+        address_alloc: &mut DeviceAddressAllocator,
+    ) -> Result<DeviceHandle, UsbHostError> {
+        let mut buffer: [u8; 18] = [0u8; 18];
+        let d = self.get_device_descriptor(&mut buffer).await?;
+        let max_packet_size = d.max_packet_size;
+        let addr = address_alloc.alloc_device_address();
+        trace!("DeviceDescriptor: {}", d);
+
+        self.assign_device_address(addr).await?;
+        trace!("Device addressed {}", addr);
+        self.0.set_addr(addr);
+        let mut buf: [u8; 255] = [0; 255];
+        let len = unwrap!(
+            self.control_transfer(
+                &Request::get_configuration_descriptor(
+                    0,
+                    core::mem::size_of::<ConfigurationDescriptor>() as u16
+                ),
+                &mut buf,
+                max_packet_size,
+            )
+            .await
+        );
+        let cfg = parse_descriptor(&buf[..len]);
+        trace!("configuration recv {} bytes: {:?}", len, cfg);
+        self.control_transfer(&Request::set_configuration(1), &mut [], max_packet_size)
+            .await?;
+        Ok(DeviceHandle { address: addr })
+    }
 }
 
 struct BusWrap<D: Driver>(D::Bus);
@@ -228,66 +273,83 @@ impl DeviceAddressAllocator {
 }
 
 impl<D: Driver> Host<D> {
-    pub async fn run(mut self) {
+    pub async fn run_until_suspend(mut self) -> (Self, Option<DeviceHandle>) {
+        let mut state = HostState::Idle;
+        let mut handle = None;
+
         let Host {
             phantom: _,
             mut bus,
             mut pipe,
             mut address_alloc,
         } = self;
-        loop {
-            let event = bus.0.poll().await;
-            info!("event: {}", event);
-            match event {
-                Event::DeviceAttach => {
-                    bus.0.reset().await;
-                    #[cfg(feature = "embassy")]
-                    embassy_time::Timer::after_millis(500).await;
-                    let mut buffer: [u8; 18] = [0u8; 18];
-                    match pipe.get_device_descriptor(&mut buffer).await {
-                        Ok(d) => {
-                            let max_packet_size = d.max_packet_size;
-                            let addr = address_alloc.alloc_device_address();
-                            trace!("DeviceDescriptor: {}", d);
 
-                            match pipe.assign_device_address(addr).await {
-                                Ok(_) => {
-                                    trace!("Device addressed {}", addr);
-                                    pipe.0.set_addr(addr);
-                                    let mut buf: [u8; 255] = [0; 255];
-                                    let len = unwrap!(
-                                        pipe.control_transfer(
-                                            &Request::get_configuration_descriptor(
-                                                0,
-                                                core::mem::size_of::<ConfigurationDescriptor>()
-                                                    as u16
-                                            ),
-                                            &mut buf,
-                                            max_packet_size,
-                                        )
-                                        .await
-                                    );
-                                    let cfg = parse_descriptor(&buf[..len]);
-                                    trace!("configuration recv {} bytes: {:?}", len, cfg);
-                                    unwrap!(
-                                        pipe.control_transfer(
-                                            &Request::set_configuration(1),
-                                            &mut [],
-                                            max_packet_size
-                                        )
-                                        .await
-                                    );
-                                }
-                                Err(e) => debug!("{}", e),
-                            }
-                        }
-                        Err(e) => debug!("{}", e),
-                    }
+        loop {
+            match state {
+                HostState::Idle => {
+                    state = Self::run_idle(&mut bus).await;
                 }
-                Event::DeviceDetach => {}
-                Event::Suspend => {}
-                Event::Resume => {}
+                HostState::DeviceEnumerate => {
+                    state = Self::run_enumerate(&mut bus, &mut pipe, &mut address_alloc).await;
+                }
+                HostState::Suspended => break,
+                HostState::DeviceAttached(d) => {
+                    handle.replace(d);
+                    break;
+                }
             }
+        }
+
+        (
+            Host {
+                phantom: PhantomData,
+                bus,
+                pipe,
+                address_alloc,
+            },
+            handle,
+        )
+    }
+
+    async fn run_idle(bus: &mut BusWrap<D>) -> HostState {
+        let event = bus.0.poll().await;
+        Self::handle_bus_event(bus, event).await
+    }
+
+    async fn handle_bus_event(bus: &mut BusWrap<D>, event: Event) -> HostState {
+        info!("event: {}", event);
+        match event {
+            Event::DeviceAttach => {
+                bus.0.reset().await;
+                #[cfg(feature = "embassy")]
+                embassy_time::Timer::after_millis(500).await;
+
+                HostState::DeviceEnumerate
+            }
+            Event::DeviceDetach => HostState::Suspended,
+            Event::Suspend => HostState::Suspended,
+            Event::Resume => HostState::Idle,
+        }
+    }
+
+    async fn run_enumerate(
+        bus: &mut BusWrap<D>,
+        pipe: &mut PipeWrap<D>,
+        address_alloc: &mut DeviceAddressAllocator,
+    ) -> HostState {
+        let pipe_future = pipe.dev_attach(address_alloc);
+        let bus_future = bus.0.poll();
+
+        match select(pipe_future, bus_future).await {
+            Either::First(device_result) => match device_result {
+                Ok(dev) => HostState::DeviceAttached(dev),
+                Err(e) => {
+                    debug!("{}", e);
+                    HostState::Idle
+                }
+            },
+            // TODO this is firing a RESUME event and dropping pipe_future
+            Either::Second(event) => Self::handle_bus_event(bus, event).await,
         }
     }
 }
