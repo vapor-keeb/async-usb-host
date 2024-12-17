@@ -45,6 +45,9 @@ pub enum ParsingError {
 }
 
 pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError> {
+    #[cfg(not(target_endian="little"))]
+    compile_error!("This function only works for little endian architechture");
+    
     if buf.len() < core::mem::size_of::<DescriptorHeader>() {
         return Err(ParsingError::Incomplete);
     }
@@ -97,7 +100,7 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
     }
 }
 
-#[repr(C, packed)]
+#[cfg_attr(target_endian="little", repr(C, packed))]
 struct DescriptorHeader {
     length: u8,
     descriptor_type: u8,
@@ -107,7 +110,7 @@ struct DescriptorHeader {
 /// globally to the device and all of the device’s configurations. A USB device has only one device descriptor.
 // #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
-#[repr(C, packed)]
+#[cfg_attr(target_endian="little", repr(C, packed))]
 pub struct DeviceDescriptor {
     pub length: u8,
     pub descriptor_type: DescriptorType,
@@ -246,7 +249,7 @@ impl defmt::Format for ConfigurationAttributes {
 /// The descriptor contains a bConfigurationValue field with a value that, when used as a parameter
 /// to the SetConfiguration() request, causes the device to assume the described configuration.
 #[derive(Clone)]
-#[repr(C, packed)]
+#[cfg_attr(target_endian="little", repr(C, packed))]
 pub struct ConfigurationDescriptor {
     pub length: u8,
     pub descriptor_type: DescriptorType,
