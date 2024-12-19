@@ -1,13 +1,15 @@
 #![no_std]
-use core::{marker::PhantomData, mem::transmute};
+use core::{marker::PhantomData, mem::transmute, task::Poll};
 
 use descriptor::{parse_descriptor, ConfigurationDescriptor, DeviceDescriptor};
 use embassy_futures::select::{select, Either};
 use errors::UsbHostError;
+use futures::poll_select;
 use request::{Request, StandardDeviceRequest};
 
 pub mod descriptor;
 pub mod errors;
+mod futures;
 mod macros;
 pub mod request;
 pub mod types;
@@ -340,16 +342,23 @@ impl<D: Driver> Host<D> {
         let pipe_future = pipe.dev_attach(address_alloc);
         let bus_future = bus.0.poll();
 
-        match select(pipe_future, bus_future).await {
-            Either::First(device_result) => match device_result {
+        poll_select(pipe_future, bus_future, |either| match either {
+            futures::Either::First(device_result) => Poll::Ready(match device_result {
                 Ok(dev) => HostState::DeviceAttached(dev),
                 Err(e) => {
                     debug!("{}", e);
                     HostState::Idle
                 }
-            },
-            // TODO this is firing a RESUME event and dropping pipe_future
-            Either::Second(event) => Self::handle_bus_event(bus, event).await,
-        }
+            }),
+            futures::Either::Second(event) => {
+                // Self::handle_bus_event(bus, event);
+                info!("event: {}", event);
+                match event {
+                    Event::DeviceDetach => Poll::Ready(HostState::Idle),
+                    _ => Poll::Pending
+                }
+            }
+        })
+        .await
     }
 }
