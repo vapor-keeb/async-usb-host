@@ -1,5 +1,7 @@
 use crate::types::Bcd16;
 
+pub mod hub;
+
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[derive(Copy, Clone)]

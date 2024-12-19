@@ -1,5 +1,7 @@
 use crate::descriptor::DescriptorType;
 
+pub mod hub;
+
 // Note, this does not have packed, becuase it happens to be aligned.
 // so there is the static assert there.
 #[repr(C)]
@@ -82,6 +84,11 @@ pub enum RequestTypeRecipient {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Default)]
+/**
+ * D7:7 Direction (1: Device to Host)
+ * D6:5 Type
+ * D4:0 Recipient
+ */
 pub struct RequestType(u8);
 
 impl RequestType {
