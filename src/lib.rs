@@ -1,5 +1,5 @@
 #![no_std]
-use core::{marker::PhantomData, mem::transmute, task::Poll};
+use core::{future::Future, marker::PhantomData, mem::transmute, task::Poll};
 
 use descriptor::{parse_descriptor, ConfigurationDescriptor, DeviceDescriptor};
 use embassy_futures::select::{select, Either};
@@ -26,7 +26,10 @@ pub enum Event {
 #[allow(async_fn_in_trait)]
 pub trait Bus {
     async fn reset(&mut self);
-    async fn poll(&mut self) -> Event;
+    /// must be able to resume after completion
+    /// aka poll after returning Poll::Ready(_)
+    /// the built-in async keyword does not allow this
+    fn poll(&mut self) -> impl Future<Output = Event>;
 }
 
 // not Send anyways
@@ -355,7 +358,7 @@ impl<D: Driver> Host<D> {
                 info!("event: {}", event);
                 match event {
                     Event::DeviceDetach => Poll::Ready(HostState::Idle),
-                    _ => Poll::Pending
+                    _ => Poll::Pending,
                 }
             }
         })
