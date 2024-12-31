@@ -71,7 +71,7 @@ impl<D: Driver> Host<D> {
         Host {
             bus: BusWrap(bus),
             pipe: PipeWrap(pipe),
-            address_alloc: DeviceAddressAllocator(1),
+            address_alloc: DeviceAddressAllocator::new(),
             phantom: PhantomData,
         }
     }
@@ -265,15 +265,52 @@ impl<D: Driver> PipeWrap<D> {
 
 struct BusWrap<D: Driver>(D::Bus);
 
-struct DeviceAddressAllocator(u8);
+struct DeviceAddressAllocator([u8; 16]);
 
 impl DeviceAddressAllocator {
-    fn alloc_device_address(&mut self) -> u8 {
-        let addr = self.0;
-        // TODO allocate and free addresses properly
-        assert!(addr <= 127, "out of addr");
-        self.0 += 1;
+    // Construct an allocator with all addresses except 0 occupied.
+    pub fn new() -> Self {
+        let mut alloc = DeviceAddressAllocator([0; 16]);
+        // Address 0 is always used;
+        alloc.0[0] = 1;
+        alloc
+    }
+
+    fn set_addr(&mut self, addr: u8, used: bool) {
+        debug_assert_ne!(addr, 0);
+        let nth_byte = addr / 8;
+        let bit_offset = addr % 8;
+        let rest = self.0[nth_byte as usize] & !(1u8 << bit_offset);
+        self.0[nth_byte as usize] = rest & ((if used { 1 } else { 0 }) << bit_offset);
+    }
+
+    pub fn alloc_device_address(&mut self) -> u8 {
+        let mut addr: Option<u8> = None;
+
+        'outer: for nth_byte in 0..8usize {
+            // has at least one 0 bit
+            if self.0[nth_byte] != 0xFF {
+                let byte = self.0[nth_byte];
+                for bit_offset in 0..8 {
+                    if (byte & (1 << bit_offset)) == 0 {
+                        addr.replace(nth_byte as u8 * 8 + bit_offset);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        assert!(addr.is_some(), "Ran out of address");
+
+        let addr = addr.unwrap();
+        // Mark address as used
+        self.set_addr(addr, true);
+
         return addr;
+    }
+    
+    pub fn free_address(&mut self, addr: u8) {
+        self.set_addr(addr, false);
     }
 }
 
