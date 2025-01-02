@@ -281,7 +281,7 @@ impl DeviceAddressAllocator {
         let nth_byte = addr / 8;
         let bit_offset = addr % 8;
         let rest = self.0[nth_byte as usize] & !(1u8 << bit_offset);
-        self.0[nth_byte as usize] = rest & ((if used { 1 } else { 0 }) << bit_offset);
+        self.0[nth_byte as usize] = rest | ((if used { 1 } else { 0 }) << bit_offset);
     }
 
     pub fn alloc_device_address(&mut self) -> u8 {
@@ -303,12 +303,13 @@ impl DeviceAddressAllocator {
         assert!(addr.is_some(), "Ran out of address");
 
         let addr = addr.unwrap();
+        debug_assert_ne!(addr, 0);
         // Mark address as used
         self.set_addr(addr, true);
 
         return addr;
     }
-    
+
     pub fn free_address(&mut self, addr: u8) {
         self.set_addr(addr, false);
     }
