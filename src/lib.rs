@@ -3,6 +3,9 @@ use core::{future::Future, marker::PhantomData, mem::transmute, task::Poll};
 
 use descriptor::{parse_descriptor, ConfigurationDescriptor, DeviceDescriptor};
 use embassy_futures::select::{select, Either};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
+};
 use errors::UsbHostError;
 use futures::poll_select;
 use request::{Request, StandardDeviceRequest};
@@ -57,21 +60,59 @@ pub enum HostState {
     Suspended,
 }
 
-pub struct Host<D: Driver> {
+pub enum HostRequest {
+    ClientReady,
+}
+
+pub struct HostControl {
+    signal: Signal<CriticalSectionRawMutex, bool>,
+}
+
+impl HostControl {
+    pub const fn new() -> Self {
+        HostControl {
+            signal: Signal::new(),
+        }
+    }
+}
+
+pub struct HostHandle {
+    recv: Channel<CriticalSectionRawMutex, (), 1>,
+    send: Channel<CriticalSectionRawMutex, HostRequest, 1>,
+}
+
+impl HostHandle {
+    pub const fn new() -> Self {
+        HostHandle {
+            recv: Channel::new(),
+            send: Channel::new(),
+        }
+    }
+}
+
+pub struct Host<'a, D: Driver, const NR_CLIENTS: usize> {
     phantom: PhantomData<D>,
+    host_control: &'a HostControl,
+    clients: [&'a HostHandle; NR_CLIENTS],
     bus: BusWrap<D>,
     pipe: PipeWrap<D>,
     address_alloc: DeviceAddressAllocator,
 }
 
-impl<D: Driver> Host<D> {
-    pub fn new(driver: D) -> Self {
+impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
+    pub fn new(
+        driver: D,
+        host_control: &'a HostControl,
+        clients: [&'a HostHandle; NR_CLIENTS],
+    ) -> Self {
         let (bus, pipe) = driver.start();
 
         Host {
             bus: BusWrap(bus),
             pipe: PipeWrap(pipe),
             address_alloc: DeviceAddressAllocator::new(),
+            host_control,
+            clients,
             phantom: PhantomData,
         }
     }
@@ -315,7 +356,7 @@ impl DeviceAddressAllocator {
     }
 }
 
-impl<D: Driver> Host<D> {
+impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
     pub async fn run_until_suspend(mut self) -> (Self, Option<DeviceHandle>) {
         let mut state = HostState::Idle;
         let mut handle = None;
@@ -325,6 +366,8 @@ impl<D: Driver> Host<D> {
             mut bus,
             mut pipe,
             mut address_alloc,
+            host_control,
+            clients,
         } = self;
 
         loop {
@@ -349,6 +392,8 @@ impl<D: Driver> Host<D> {
                 bus,
                 pipe,
                 address_alloc,
+                host_control,
+                clients,
             },
             handle,
         )
