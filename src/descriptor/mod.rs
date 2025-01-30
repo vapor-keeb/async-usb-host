@@ -49,7 +49,7 @@ pub enum ParsingError {
 pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError> {
     #[cfg(not(target_endian="little"))]
     compile_error!("This function only works for little endian architechture");
-    
+
     if buf.len() < core::mem::size_of::<DescriptorHeader>() {
         return Err(ParsingError::Incomplete);
     }
@@ -113,6 +113,7 @@ struct DescriptorHeader {
 // #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[cfg_attr(target_endian="little", repr(C, packed))]
+#[derive(Clone)]
 pub struct DeviceDescriptor {
     pub length: u8,
     pub descriptor_type: DescriptorType,
@@ -284,13 +285,13 @@ impl defmt::Format for ConfigurationDescriptor {
     fn format(&self, f: defmt::Formatter) {
         defmt::write!(
             f,
-            "ConfigurationDescriptor {{ 
-\ttotal_length: {}, 
-\tnum_interfaces: {}, 
-\tvalue: {}, 
-\tindex: {}, 
-\tattributes: {}, 
-\tmax_power: {} mA 
+            "ConfigurationDescriptor {{
+\ttotal_length: {},
+\tnum_interfaces: {},
+\tvalue: {},
+\tindex: {},
+\tattributes: {},
+\tmax_power: {} mA
 }}",
             { self.total_length },
             self.num_interfaces,
