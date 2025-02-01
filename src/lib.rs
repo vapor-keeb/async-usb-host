@@ -6,7 +6,7 @@ use embassy_futures::select::{self, select, select_array, Either};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
 };
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
 use request::{Request, StandardDeviceRequest};
@@ -14,9 +14,12 @@ use request::{Request, StandardDeviceRequest};
 pub mod descriptor;
 pub mod errors;
 mod futures;
+mod hot_potato;
 mod macros;
 pub mod request;
 pub mod types;
+
+const TRANSFER_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Event {
@@ -78,9 +81,14 @@ impl HostControl {
     }
 }
 
-#[cfg_attr(feature="defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Client2HostMessage {
     ClientReady,
+    ControlTransfer {
+        dev_handle: DeviceHandle,
+        request: Request,
+        buffer: &'static mut [u8],
+    },
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -88,6 +96,10 @@ pub enum Host2ClientMessage {
     NewDevice {
         descriptor: DeviceDescriptor,
         handle: DeviceHandle,
+    },
+    ControlTransferResponse {
+        result: Result<usize, UsbHostError>,
+        buffer: &'static mut [u8],
     },
 }
 
@@ -112,6 +124,30 @@ impl HostHandle {
 
     pub async fn recv(&self) -> Host2ClientMessage {
         self.host2client.receive().await
+    }
+
+    pub async fn control_transfer(
+        &self,
+        dev_handle: DeviceHandle,
+        request: Request,
+        buffer: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
+        hot_potato::toss_potato_async(buffer, async |potate| {
+            self.client2host
+                .send(Client2HostMessage::ControlTransfer {
+                    dev_handle,
+                    request,
+                    buffer: potate,
+                })
+                .await;
+
+            let result = self.host2client.receive().await;
+            match result {
+                Host2ClientMessage::ControlTransferResponse { result, buffer } => (buffer, result),
+                _ => panic!(),
+            }
+        })
+        .await
     }
 }
 
@@ -148,13 +184,37 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceHandle {
     address: u8,
+    max_packet_size: u8,
 }
 
 struct PipeWrap<D: Driver>(D::Pipe);
 
 impl<D: Driver> PipeWrap<D> {
     async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
-        self.0.setup(unsafe { transmute(req) }).await
+        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        let setup_fut = self.0.setup(unsafe { transmute(req) });
+        match select(timeout_fut, setup_fut).await {
+            Either::First(_) => Err(UsbHostError::TransferTimeout),
+            Either::Second(r) => r,
+        }
+    }
+
+    async fn data_in(&mut self, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        let data_fut = self.0.data_in(buf);
+        match select(timeout_fut, data_fut).await {
+            Either::First(_) => Err(UsbHostError::TransferTimeout),
+            Either::Second(r) => r,
+        }
+    }
+
+    async fn data_out(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
+        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        let data_fut = self.0.data_out(buf);
+        match select(timeout_fut, data_fut).await {
+            Either::First(_) => Err(UsbHostError::TransferTimeout),
+            Either::Second(r) => r,
+        }
     }
 
     async fn assign_device_address(&mut self, addr: u8) -> Result<(), UsbHostError> {
@@ -175,7 +235,7 @@ impl<D: Driver> PipeWrap<D> {
         // Setup stage
         self.setup(&request).await?;
         // Status stage (no data)
-        self.0.data_in(&mut []).await?;
+        self.data_in(&mut []).await?;
 
         Ok(())
     }
@@ -204,7 +264,7 @@ impl<D: Driver> PipeWrap<D> {
 
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = self.0.data_in(buf).await?;
+        let in_result = self.data_in(buf).await?;
         bytes_read += in_result;
 
         let max_packet_size = match parse_descriptor(&buf[..bytes_read]) {
@@ -230,7 +290,6 @@ impl<D: Driver> PipeWrap<D> {
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
             let in_result = self
-                .0
                 .data_in(unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
@@ -242,7 +301,7 @@ impl<D: Driver> PipeWrap<D> {
         }
 
         // Status stage
-        self.0.data_out(&[]).await?;
+        self.data_out(&[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         match parse_descriptor(buf) {
@@ -277,7 +336,7 @@ impl<D: Driver> PipeWrap<D> {
             match dir {
                 RequestTypeDirection::HostToDevice => todo!(),
                 RequestTypeDirection::DeviceToHost => loop {
-                    let len = self.0.data_in(&mut buffer[bytes_received..]).await?;
+                    let len = self.data_in(&mut buffer[bytes_received..]).await?;
                     bytes_received += len;
                     if len < max_packet_size as usize {
                         break;
@@ -289,10 +348,10 @@ impl<D: Driver> PipeWrap<D> {
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                self.0.data_in(&mut []).await?;
+                self.data_in(&mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                self.0.data_out(&[]).await?;
+                self.data_out(&[]).await?;
             }
         }
 
@@ -330,7 +389,13 @@ impl<D: Driver> PipeWrap<D> {
         // self.control_transfer(&Request::set_configuration(1), &mut [], max_packet_size)
         //     .await?;
 
-        Ok((d.clone(), DeviceHandle { address: addr }))
+        Ok((
+            d.clone(),
+            DeviceHandle {
+                address: addr,
+                max_packet_size,
+            },
+        ))
     }
 }
 
@@ -436,13 +501,13 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                         }
                         Either::Second(bus_event) => {
                             Self::handle_bus_event(&mut self.bus, bus_event).await
-                        },
+                        }
                     }
                 }
                 HostState::Suspended => {
                     self.state = HostState::Disconnected;
                     break;
-                },
+                }
             }
         }
     }
