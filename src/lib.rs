@@ -217,6 +217,10 @@ impl<D: Driver> PipeWrap<D> {
         }
     }
 
+    fn set_addr(&mut self, addr: u8) {
+        self.0.set_addr(addr);
+    }
+
     async fn assign_device_address(&mut self, addr: u8) -> Result<(), UsbHostError> {
         let request = Request {
             request_type: {
@@ -316,7 +320,7 @@ impl<D: Driver> PipeWrap<D> {
         }
     }
 
-    pub async fn control_transfer(
+    async fn control_transfer(
         &mut self,
         request: &Request,
         buffer: &mut [u8],
@@ -467,7 +471,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                     info!("Driver ready!");
                     HostState::Disconnected
                 }
-                HostState::Disconnected => Self::run_idle(&mut self.bus).await,
+                HostState::Disconnected => Self::run_disconnected(&mut self.bus).await,
                 HostState::DeviceEnumerate => self.run_enumerate().await,
                 HostState::DeviceAttached { handle, descriptor } => {
                     let mut accepted = false;
@@ -488,22 +492,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
 
                     HostState::Idle
                 }
-                HostState::Idle => {
-                    let futures: [_; NR_CLIENTS] =
-                        array::from_fn(|i| self.clients[i].client2host.receive());
-
-                    let client_request_fut = select_array(futures);
-                    let bus_fut = self.bus.0.poll();
-                    match select(client_request_fut, bus_fut).await {
-                        Either::First((client_request, client_id)) => {
-                            trace!("got request: {}, {:?}", client_id, client_request);
-                            HostState::Idle
-                        }
-                        Either::Second(bus_event) => {
-                            Self::handle_bus_event(&mut self.bus, bus_event).await
-                        }
-                    }
-                }
+                HostState::Idle => self.run_idle().await,
                 HostState::Suspended => {
                     self.state = HostState::Disconnected;
                     break;
@@ -512,7 +501,29 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         }
     }
 
-    async fn run_idle(bus: &mut BusWrap<D>) -> HostState {
+    async fn run_idle(&mut self) -> HostState {
+        let futures: [_; NR_CLIENTS] = array::from_fn(|i| self.clients[i].client2host.receive());
+
+        let client_request_fut = select_array(futures);
+        let bus_fut = self.bus.0.poll();
+        match select(client_request_fut, bus_fut).await {
+            Either::First((client_request, client_id)) => {
+                trace!("got request: {}, {:?}", client_id, client_request);
+                match client_request {
+                    Client2HostMessage::ClientReady => warn!("client ready"),
+                    Client2HostMessage::ControlTransfer { dev_handle, request, buffer } => {
+                        self.pipe.set_addr(dev_handle.address);
+                        let result = self.pipe.control_transfer(&request, buffer, dev_handle.max_packet_size).await;
+                        self.clients[client_id].host2client.send(Host2ClientMessage::ControlTransferResponse { result, buffer }).await;
+                    },
+                }
+                HostState::Idle
+            }
+            Either::Second(bus_event) => Self::handle_bus_event(&mut self.bus, bus_event).await,
+        }
+    }
+
+    async fn run_disconnected(bus: &mut BusWrap<D>) -> HostState {
         let event = bus.0.poll().await;
         Self::handle_bus_event(bus, event).await
     }
