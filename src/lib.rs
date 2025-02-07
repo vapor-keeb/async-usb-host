@@ -1,12 +1,12 @@
 #![no_std]
 use core::{array, future::Future, marker::PhantomData, mem::transmute, task::Poll};
 
-use descriptor::{parse_descriptor, ConfigurationDescriptor, DeviceDescriptor};
-use embassy_futures::select::{self, select, select_array, Either};
+use descriptor::{parse_descriptor, DeviceDescriptor};
+use embassy_futures::select::{select, select_array, Either};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
 };
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
 use request::{Request, StandardDeviceRequest};
