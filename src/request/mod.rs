@@ -9,11 +9,11 @@ pub mod hub;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Request {
     /// bit map of request type
-    pub request_type: RequestType,
-    pub request: u8,
-    pub value: u16,
-    pub index: u16,
-    pub length: u16,
+    pub(crate) request_type: RequestType,
+    pub(crate) request: u8,
+    pub(crate) value: u16,
+    pub(crate) index: u16,
+    pub(crate) length: u16,
 }
 static_assertions::const_assert_eq!(core::mem::size_of::<Request>(), 8);
 
@@ -33,24 +33,37 @@ impl Request {
         }
     }
 
-    fn get_descriptor(descriptor_type: DescriptorType, descriptor_index: u8, language_id: u16, length: u16) -> Request {
+    pub fn get_descriptor(
+        descriptor_type: u8,
+        request_type_type: RequestTypeType,
+        descriptor_index: u8,
+        language_id: u16,
+        length: u16,
+    ) -> Request {
         debug_assert!(length > 0);
         Request {
             request_type: {
                 let mut t = RequestType::default();
                 t.set_data_direction(RequestTypeDirection::DeviceToHost);
+                t.set_type(request_type_type);
                 t.set_recipient(RequestTypeRecipient::Device);
                 t
             },
             request: StandardDeviceRequest::GetDescriptor as u8,
-            value: (((descriptor_type as u8) as u16) << 8) | (descriptor_index as u16),
+            value: ((descriptor_type as u16) << 8) | (descriptor_index as u16),
             index: language_id,
             length: length,
         }
     }
 
     pub fn get_configuration_descriptor(index: u8, length: u16) -> Request {
-        Self::get_descriptor(DescriptorType::Configuration, index, 0, length)
+        Self::get_descriptor(
+            DescriptorType::Configuration as u8,
+            RequestTypeType::Standard,
+            index,
+            0,
+            length,
+        )
     }
 }
 
@@ -104,9 +117,12 @@ impl RequestType {
         self.0 = (self.0 & 0x7F) | ((dir as u8 & 0x1) << 7);
     }
 
-    // TODO: Type
-    pub fn request_type(&self) -> RequestTypeType {
-        RequestTypeType::Standard
+    // Not needed? TODO remove
+    // pub fn request_type(&self) -> RequestTypeType {
+    // }
+
+    pub fn set_type(&mut self, typetype: RequestTypeType) {
+        self.0 = (self.0 & !(0x3 << 5)) | ((typetype as u8) << 5);
     }
 
     pub fn recipient(&self) -> RequestTypeRecipient {
@@ -127,9 +143,9 @@ impl defmt::Format for RequestType {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(
             fmt,
-            "RequestType {{ Dir: {}, Type: {}, Recipient: {} }}",
+            "RequestType {{ Dir: {}, Type: TODO, Recipient: {} }}",
             self.data_direction(),
-            self.request_type(),
+            // self.request_type(),
             self.recipient(),
         )
     }

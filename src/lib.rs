@@ -1,7 +1,8 @@
 #![no_std]
 use core::{array, future::Future, marker::PhantomData, mem::transmute, task::Poll};
 
-use descriptor::{parse_descriptor, DeviceDescriptor};
+use consts::UsbBaseClass;
+use descriptor::{hub::HubDescriptor, parse_descriptor, DescriptorType, DeviceDescriptor};
 use embassy_futures::select::{select, select_array, Either};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
@@ -9,8 +10,9 @@ use embassy_sync::{
 use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
-use request::{Request, StandardDeviceRequest};
+use request::{Request, RequestType, StandardDeviceRequest};
 
+pub mod consts;
 pub mod descriptor;
 pub mod errors;
 mod futures;
@@ -179,6 +181,37 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
             phantom: PhantomData,
         }
     }
+
+    async fn register_hub(
+        &mut self,
+        handle: DeviceHandle,
+        descriptor: DeviceDescriptor,
+    ) -> Result<(), UsbHostError> {
+        let mut hub_desc = HubDescriptor::default();
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                &raw mut hub_desc as *mut u8,
+                core::mem::size_of::<HubDescriptor>(),
+            )
+        };
+        self.pipe
+            .control_transfer(
+                &Request::get_descriptor(
+                    0x29, // Hub Descriptor
+                    request::RequestTypeType::Class,
+                    0,
+                    0,
+                    buf.len() as u16,
+                ),
+                buf,
+                handle.max_packet_size,
+            )
+            .await?;
+
+        debug!("hub descriptor: {:?}", hub_desc);
+
+        Ok(())
+    }
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -201,8 +234,19 @@ impl<D: Driver> PipeWrap<D> {
 
     async fn data_in(&mut self, buf: &mut [u8]) -> Result<usize, UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let data_fut = self.0.data_in(buf);
-        match select(timeout_fut, data_fut).await {
+        let mut data_in_with_retry = async || loop {
+            match self.0.data_in(buf).await {
+                Ok(size) => return Ok(size),
+                Err(UsbHostError::NAK) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        };
+        let data_in_fut = data_in_with_retry();
+        match select(timeout_fut, data_in_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
         }
@@ -255,6 +299,7 @@ impl<D: Driver> PipeWrap<D> {
                 use request::*;
                 let mut rt = RequestType::default();
                 rt.set_data_direction(RequestTypeDirection::DeviceToHost);
+                rt.set_type(RequestTypeType::Standard);
                 rt.set_recipient(RequestTypeRecipient::Device);
                 rt
             },
@@ -271,22 +316,7 @@ impl<D: Driver> PipeWrap<D> {
         let in_result = self.data_in(buf).await?;
         bytes_read += in_result;
 
-        let max_packet_size = match parse_descriptor(&buf[..bytes_read]) {
-            Ok(desc) => {
-                if let descriptor::Descriptor::Device(dev_desc) = desc {
-                    return Ok(dev_desc);
-                }
-                return Err(UsbHostError::Unknown);
-            }
-            Err(descriptor::ParsingError::IncompleteDeviceDescriptor { max_packet_size }) => {
-                max_packet_size
-            }
-            Err(e) => return Err(UsbHostError::ParsingError(e)),
-        };
-
-        debug_assert!(max_packet_size % 8 == 0);
-
-        while bytes_read < 18 {
+        while bytes_read < core::mem::size_of::<DeviceDescriptor>() {
             let chopped_off_buf = &buf[bytes_read..];
             // SAFETY:
             // If the return Ok(desc); statement within the match block was executed,
@@ -474,21 +504,26 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                 HostState::Disconnected => Self::run_disconnected(&mut self.bus).await,
                 HostState::DeviceEnumerate => self.run_enumerate().await,
                 HostState::DeviceAttached { handle, descriptor } => {
-                    let mut accepted = false;
-                    for client in self.clients {
-                        if (client.accept_device)(&descriptor) {
-                            client
-                                .host2client
-                                .send(Host2ClientMessage::NewDevice {
-                                    descriptor: descriptor,
-                                    handle: handle,
-                                })
-                                .await;
-                            accepted = true;
-                            break;
+                    if descriptor.device_class == UsbBaseClass::Hub.into() {
+                        unwrap!(self.register_hub(handle, descriptor).await);
+                    } else {
+                        let mut accepted = false;
+
+                        for client in self.clients {
+                            if (client.accept_device)(&descriptor) {
+                                client
+                                    .host2client
+                                    .send(Host2ClientMessage::NewDevice {
+                                        descriptor: descriptor,
+                                        handle: handle,
+                                    })
+                                    .await;
+                                accepted = true;
+                                break;
+                            }
                         }
+                        trace!("device accepted?: {}", accepted);
                     }
-                    trace!("device accepted?: {}", accepted);
 
                     HostState::Idle
                 }
@@ -511,11 +546,21 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                 trace!("got request: {}, {:?}", client_id, client_request);
                 match client_request {
                     Client2HostMessage::ClientReady => warn!("client ready"),
-                    Client2HostMessage::ControlTransfer { dev_handle, request, buffer } => {
+                    Client2HostMessage::ControlTransfer {
+                        dev_handle,
+                        request,
+                        buffer,
+                    } => {
                         self.pipe.set_addr(dev_handle.address);
-                        let result = self.pipe.control_transfer(&request, buffer, dev_handle.max_packet_size).await;
-                        self.clients[client_id].host2client.send(Host2ClientMessage::ControlTransferResponse { result, buffer }).await;
-                    },
+                        let result = self
+                            .pipe
+                            .control_transfer(&request, buffer, dev_handle.max_packet_size)
+                            .await;
+                        self.clients[client_id]
+                            .host2client
+                            .send(Host2ClientMessage::ControlTransferResponse { result, buffer })
+                            .await;
+                    }
                 }
                 HostState::Idle
             }
