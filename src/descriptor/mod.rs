@@ -1,3 +1,5 @@
+use defmt::Format;
+
 use crate::types::Bcd16;
 
 pub mod hub;
@@ -34,6 +36,8 @@ impl TryFrom<u8> for DescriptorType {
 pub enum Descriptor<'d> {
     Device(&'d DeviceDescriptor),
     Configuration(&'d ConfigurationDescriptor),
+    Endpoint(&'d EndpointDescriptor),
+    Interface(&'d InterfaceDescriptor),
 }
 
 #[derive(Clone, Copy)]
@@ -47,7 +51,7 @@ pub enum ParsingError {
 }
 
 pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError> {
-    #[cfg(not(target_endian="little"))]
+    #[cfg(not(target_endian = "little"))]
     compile_error!("This function only works for little endian architechture");
 
     if buf.len() < core::mem::size_of::<DescriptorHeader>() {
@@ -97,12 +101,28 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
             }
         }
         DescriptorType::String => panic!(),
-        DescriptorType::Interface => panic!(),
-        DescriptorType::Endpoint => panic!(),
+        DescriptorType::Interface => {
+            if buf.len() < core::mem::size_of::<InterfaceDescriptor>() {
+                Err(ParsingError::Incomplete)
+            } else {
+                Ok(Descriptor::Interface(unsafe {
+                    core::mem::transmute(buf.as_ptr())
+                }))
+            }
+        }
+        DescriptorType::Endpoint => {
+            if buf.len() < core::mem::size_of::<EndpointDescriptor>() {
+                Err(ParsingError::Incomplete)
+            } else {
+                Ok(Descriptor::Endpoint(unsafe {
+                    core::mem::transmute(buf.as_ptr())
+                }))
+            }
+        }
     }
 }
 
-#[cfg_attr(target_endian="little", repr(C, packed))]
+#[cfg_attr(target_endian = "little", repr(C, packed))]
 struct DescriptorHeader {
     length: u8,
     descriptor_type: u8,
@@ -112,7 +132,7 @@ struct DescriptorHeader {
 /// globally to the device and all of the device’s configurations. A USB device has only one device descriptor.
 // #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
-#[cfg_attr(target_endian="little", repr(C, packed))]
+#[cfg_attr(target_endian = "little", repr(C, packed))]
 #[derive(Clone)]
 pub struct DeviceDescriptor {
     pub length: u8,
@@ -252,7 +272,7 @@ impl defmt::Format for ConfigurationAttributes {
 /// The descriptor contains a bConfigurationValue field with a value that, when used as a parameter
 /// to the SetConfiguration() request, causes the device to assume the described configuration.
 #[derive(Clone)]
-#[cfg_attr(target_endian="little", repr(C, packed))]
+#[cfg_attr(target_endian = "little", repr(C, packed))]
 pub struct ConfigurationDescriptor {
     pub length: u8,
     pub descriptor_type: DescriptorType,
@@ -301,4 +321,171 @@ impl defmt::Format for ConfigurationDescriptor {
             self.max_power * 2
         )
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct EndpointDescriptor {
+    /// bLength
+    ///
+    /// Size of this descriptor in bytes.
+    pub b_length: u8,
+
+    /// bDescriptorType
+    ///
+    /// Descriptor type. Always `DESCRIPTOR_TYPE_ENDPOINT (0x05)` for Endpoint Descriptors.
+    pub b_descriptor_type: u8,
+
+    /// bEndpointAddress
+    ///
+    /// The address of the endpoint on the USB device.
+    ///
+    /// - Bits 3..0: Endpoint Number.
+    /// - Bit 7: Endpoint Direction.
+    ///   - 0 = OUT endpoint (device-to-host)
+    ///   - 1 = IN endpoint (host-to-device)
+    pub b_endpoint_address: u8,
+
+    /// bmAttributes
+    ///
+    /// Attributes of the endpoint.
+    ///
+    /// - Bits 1..0: Transfer Type
+    ///   - 00 = Control
+    ///   - 01 = Isochronous
+    ///   - 10 = Bulk
+    ///   - 11 = Interrupt
+    /// - Bits 3..2: For Isochronous Endpoints only - Synchronization Type
+    ///   - 00 = No Synchronization
+    ///   - 01 = Asynchronous
+    ///   - 10 = Adaptive
+    ///   - 11 = Synchronous
+    /// - Bits 5..4: For Isochronous Endpoints only - Usage Type
+    ///   - 00 = Data Endpoint
+    ///   - 01 = Feedback Endpoint
+    ///   - 10 = Implicit Feedback Data Endpoint
+    ///   - 11 = Reserved
+    pub bm_attributes: u8,
+
+    /// wMaxPacketSize
+    ///
+    /// Maximum packet size this endpoint is capable of sending or receiving.
+    /// For high-speed and super-speed endpoints, bits 10..0 specify the maximum
+    /// packet size. Bits 12..11 are used for high-speed isochronous endpoints
+    /// to indicate the number of transactions per microframe (transactions per
+    /// microframe = bits 12..11 + 1). For other endpoint types and speeds, these
+    /// bits should be zero.
+    pub w_max_packet_size: u16,
+
+    /// bInterval
+    ///
+    /// For interrupt and isochronous endpoints, this value indicates the polling
+    /// interval in frames (for full/low speed) or microframes (for high speed)
+    /// for interrupt endpoints or the service interval for isochronous endpoints.
+    /// The value ranges from 1 to 255.  Interpretation depends on endpoint speed.
+    pub b_interval: u8,
+    // /// bSynchAddress (Optional, present for Isochronous Endpoints with Synchronization Type)
+    // ///
+    // /// For isochronous endpoints using synchronization type, this field specifies
+    // /// the endpoint address of the synchronization endpoint.  If not used, it's usually 0.
+    // pub bSynchAddress: u8,
+
+    // /// bRefreshRate (Optional, present for Isochronous Feedback Endpoints)
+    // ///
+    // /// For isochronous feedback endpoints, this field specifies the rate at which
+    // /// feedback data is refreshed. If not used, it's usually 0.
+    // pub bRefreshRate: u8,
+}
+
+/// NOT READ BY A HUMAN. 99% generated
+impl Format for EndpointDescriptor {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "EndpointDescriptor {{");
+        defmt::write!(fmt, ".b_length: {},", self.b_length);
+        defmt::write!(fmt, ".b_descriptor_type: {:#02X},", self.b_descriptor_type);
+        defmt::debug_assert_eq!(
+            self.b_descriptor_type,
+            0x05,
+            "bDescriptorType should be 0x05 for EndpointDescriptor"
+        );
+
+        let endpoint_number = self.b_endpoint_address & 0x0F;
+        let endpoint_direction = if (self.b_endpoint_address & 0x80) != 0 {
+            "IN"
+        } else {
+            "OUT"
+        };
+        defmt::write!(
+            fmt,
+            ".b_endpoint_address: {{ address: {}, direction: {} }},",
+            endpoint_number,
+            endpoint_direction
+        );
+
+        let transfer_type = match self.bm_attributes & 0x03 {
+            0b00 => "Control",
+            0b01 => "Isochronous",
+            0b10 => "Bulk",
+            0b11 => "Interrupt",
+            _ => "Unknown", // Should not happen
+        };
+        defmt::write!(fmt, ".bm_attributes: {{ transfer_type: {},", transfer_type);
+
+        if transfer_type == "Isochronous" {
+            let sync_type = match (self.bm_attributes >> 2) & 0x03 {
+                0b00 => "No Synchronization",
+                0b01 => "Asynchronous",
+                0b10 => "Adaptive",
+                0b11 => "Synchronous",
+                _ => "Unknown", // Should not happen
+            };
+            defmt::write!(fmt, " sync_type: {},", sync_type);
+
+            let usage_type = match (self.bm_attributes >> 4) & 0x03 {
+                0b00 => "Data Endpoint",
+                0b01 => "Feedback Endpoint",
+                0b10 => "Implicit Feedback Data Endpoint",
+                0b11 => "Reserved",
+                _ => "Unknown", // Should not happen
+            };
+            defmt::write!(fmt, " usage_type: {},", usage_type);
+        }
+        defmt::write!(fmt, " }},");
+
+        defmt::write!(fmt, ".w_max_packet_size: {},", { self.w_max_packet_size });
+        defmt::write!(fmt, ".b_interval: {},", self.b_interval);
+
+        defmt::write!(fmt, "}}");
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Format, Copy, Clone)] // Derive Format for defmt, and other useful traits
+pub struct InterfaceDescriptor {
+    /// bLength - Size of this descriptor in bytes.
+    pub b_length: u8,
+
+    /// bDescriptorType - Descriptor type. Always `USB_DESCRIPTOR_TYPE_INTERFACE` (0x04) for Interface descriptors.
+    pub b_descriptor_type: u8,
+
+    /// bInterfaceNumber - Number of this interface. Zero-based index of this interface as an argument to the Set_Configuration request.
+    pub b_interface_number: u8,
+
+    /// bAlternateSetting - Value used to select an alternate setting for this interface. Zero is used for the default setting.
+    pub b_alternate_setting: u8,
+
+    /// bNumEndpoints - Number of endpoints used by this interface (excluding endpoint zero).
+    pub b_num_endpoints: u8,
+
+    /// bInterfaceClass - Class code (assigned by the USB-IF). See USB Class Definitions.
+    pub b_interface_class: u8,
+
+    /// bInterfaceSubClass - Subclass code (assigned by the USB-IF).
+    pub b_interface_sub_class: u8,
+
+    /// bInterfaceProtocol - Protocol code (assigned by the USB-IF).
+    pub b_interface_protocol: u8,
+
+    /// iInterface - Index of string descriptor describing this interface. Zero if there is no string descriptor for this interface.
+    pub i_interface: u8,
 }

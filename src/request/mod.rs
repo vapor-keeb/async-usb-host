@@ -18,7 +18,7 @@ pub struct Request {
 static_assertions::const_assert_eq!(core::mem::size_of::<Request>(), 8);
 
 impl Request {
-    pub fn set_configuration(configuration: u16) -> Request {
+    pub fn set_configuration(configuration: u8) -> Request {
         Request {
             request_type: {
                 let mut t = RequestType::default();
@@ -27,7 +27,7 @@ impl Request {
                 t
             },
             request: StandardDeviceRequest::SetConfiguration as u8,
-            value: configuration,
+            value: configuration as u16,
             index: 0,
             length: 0,
         }

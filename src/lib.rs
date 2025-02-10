@@ -2,7 +2,10 @@
 use core::{array, future::Future, marker::PhantomData, mem::transmute, task::Poll};
 
 use consts::UsbBaseClass;
-use descriptor::{hub::HubDescriptor, parse_descriptor, DescriptorType, DeviceDescriptor};
+use descriptor::{
+    hub::HubDescriptor, parse_descriptor, ConfigurationDescriptor, Descriptor, DescriptorType,
+    DeviceDescriptor,
+};
 use embassy_futures::select::{select, select_array, Either};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
@@ -48,8 +51,8 @@ pub trait Pipe {
     /// When setup is called, it should send a setup request, also setup the
     /// hardware to send / expect DATA1 packets on subsequent data_in / data_out
     async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError>;
-    async fn data_in(&mut self, buf: &mut [u8]) -> Result<usize, UsbHostError>;
-    async fn data_out(&mut self, buf: &[u8]) -> Result<(), UsbHostError>;
+    async fn data_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbHostError>;
+    async fn data_out(&mut self, endpoint: u8, buf: &[u8]) -> Result<(), UsbHostError>;
 }
 
 pub trait Driver {
@@ -163,57 +166,6 @@ pub struct Host<'a, D: Driver, const NR_CLIENTS: usize> {
     address_alloc: DeviceAddressAllocator,
 }
 
-impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
-    pub fn new(
-        driver: D,
-        host_control: &'a HostControl,
-        clients: [&'a HostHandle; NR_CLIENTS],
-    ) -> Self {
-        let (bus, pipe) = driver.start();
-
-        Host {
-            bus: BusWrap(bus),
-            pipe: PipeWrap(pipe),
-            address_alloc: DeviceAddressAllocator::new(),
-            host_control,
-            state: HostState::Initializing,
-            clients,
-            phantom: PhantomData,
-        }
-    }
-
-    async fn register_hub(
-        &mut self,
-        handle: DeviceHandle,
-        descriptor: DeviceDescriptor,
-    ) -> Result<(), UsbHostError> {
-        let mut hub_desc = HubDescriptor::default();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(
-                &raw mut hub_desc as *mut u8,
-                core::mem::size_of::<HubDescriptor>(),
-            )
-        };
-        self.pipe
-            .control_transfer(
-                &Request::get_descriptor(
-                    0x29, // Hub Descriptor
-                    request::RequestTypeType::Class,
-                    0,
-                    0,
-                    buf.len() as u16,
-                ),
-                buf,
-                handle.max_packet_size,
-            )
-            .await?;
-
-        debug!("hub descriptor: {:?}", hub_desc);
-
-        Ok(())
-    }
-}
-
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceHandle {
     address: u8,
@@ -232,10 +184,10 @@ impl<D: Driver> PipeWrap<D> {
         }
     }
 
-    async fn data_in(&mut self, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+    async fn data_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         let mut data_in_with_retry = async || loop {
-            match self.0.data_in(buf).await {
+            match self.0.data_in(endpoint, buf).await {
                 Ok(size) => return Ok(size),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -252,9 +204,10 @@ impl<D: Driver> PipeWrap<D> {
         }
     }
 
-    async fn data_out(&mut self, buf: &[u8]) -> Result<(), UsbHostError> {
+    async fn data_out(&mut self, endpoint: u8, buf: &[u8]) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let data_fut = self.0.data_out(buf);
+        // TODO retry like data_in
+        let data_fut = self.0.data_out(endpoint, buf);
         match select(timeout_fut, data_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
@@ -283,7 +236,7 @@ impl<D: Driver> PipeWrap<D> {
         // Setup stage
         self.setup(&request).await?;
         // Status stage (no data)
-        self.data_in(&mut []).await?;
+        self.data_in(0, &mut []).await?;
 
         Ok(())
     }
@@ -313,7 +266,7 @@ impl<D: Driver> PipeWrap<D> {
 
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = self.data_in(buf).await?;
+        let in_result = self.data_in(0, buf).await?;
         bytes_read += in_result;
 
         while bytes_read < core::mem::size_of::<DeviceDescriptor>() {
@@ -324,7 +277,7 @@ impl<D: Driver> PipeWrap<D> {
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
             let in_result = self
-                .data_in(unsafe {
+                .data_in(0, unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
                         chopped_off_buf.len(),
@@ -335,7 +288,7 @@ impl<D: Driver> PipeWrap<D> {
         }
 
         // Status stage
-        self.data_out(&[]).await?;
+        self.data_out(0, &[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         match parse_descriptor(buf) {
@@ -370,7 +323,7 @@ impl<D: Driver> PipeWrap<D> {
             match dir {
                 RequestTypeDirection::HostToDevice => todo!(),
                 RequestTypeDirection::DeviceToHost => loop {
-                    let len = self.data_in(&mut buffer[bytes_received..]).await?;
+                    let len = self.data_in(0, &mut buffer[bytes_received..]).await?;
                     bytes_received += len;
                     if len < max_packet_size as usize {
                         break;
@@ -382,10 +335,10 @@ impl<D: Driver> PipeWrap<D> {
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                self.data_in(&mut []).await?;
+                self.data_in(0, &mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                self.data_out(&[]).await?;
+                self.data_out(0, &[]).await?;
             }
         }
 
@@ -404,24 +357,6 @@ impl<D: Driver> PipeWrap<D> {
 
         self.assign_device_address(addr).await?;
         trace!("Device addressed {}", addr);
-
-        // self.0.set_addr(addr);
-        // let mut buf: [u8; 255] = [0; 255];
-        // let len = unwrap!(
-        //     self.control_transfer(
-        //         &Request::get_configuration_descriptor(
-        //             0,
-        //             core::mem::size_of::<ConfigurationDescriptor>() as u16
-        //         ),
-        //         &mut buf,
-        //         max_packet_size,
-        //     )
-        //     .await
-        // );
-        // let cfg = parse_descriptor(&buf[..len]);
-        // trace!("configuration recv {} bytes: {:?}", len, cfg);
-        // self.control_transfer(&Request::set_configuration(1), &mut [], max_packet_size)
-        //     .await?;
 
         Ok((
             d.clone(),
@@ -486,6 +421,133 @@ impl DeviceAddressAllocator {
 }
 
 impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
+    pub fn new(
+        driver: D,
+        host_control: &'a HostControl,
+        clients: [&'a HostHandle; NR_CLIENTS],
+    ) -> Self {
+        let (bus, pipe) = driver.start();
+
+        Host {
+            bus: BusWrap(bus),
+            pipe: PipeWrap(pipe),
+            address_alloc: DeviceAddressAllocator::new(),
+            host_control,
+            state: HostState::Initializing,
+            clients,
+            phantom: PhantomData,
+        }
+    }
+
+    async fn register_hub(
+        &mut self,
+        handle: DeviceHandle,
+        descriptor: DeviceDescriptor,
+    ) -> Result<(), UsbHostError> {
+        let mut hub_desc = HubDescriptor::default();
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                &raw mut hub_desc as *mut u8,
+                core::mem::size_of::<HubDescriptor>(),
+            )
+        };
+        // TODO maybe control_transfer should just take an address
+        self.pipe.set_addr(handle.address);
+        self.pipe
+            .control_transfer(
+                &Request::get_descriptor(
+                    0x29, // Hub Descriptor
+                    request::RequestTypeType::Class,
+                    0,
+                    0,
+                    buf.len() as u16,
+                ),
+                buf,
+                handle.max_packet_size,
+            )
+            .await?;
+
+        debug!("hub descriptor: {:?}", hub_desc);
+
+        let mut buf: [u8; 255] = [0; 255];
+        let len = unwrap!(
+            self.pipe
+                .control_transfer(
+                    &Request::get_configuration_descriptor(
+                        0,
+                        core::mem::size_of::<ConfigurationDescriptor>() as u16
+                    ),
+                    &mut buf,
+                    handle.max_packet_size,
+                )
+                .await
+        );
+        let cfg = parse_descriptor(&buf[..len]).map_err(|e| UsbHostError::ParsingError(e))?;
+
+        trace!("configuration recv {} bytes: {:?}", len, cfg);
+        if let Descriptor::Configuration(cfg) = cfg {
+            self.pipe
+                .control_transfer(
+                    &Request::set_configuration(cfg.value),
+                    &mut [],
+                    handle.max_packet_size,
+                )
+                .await?;
+            // get configuration descriptor again with the proper len
+            let len = unwrap!(
+                self.pipe
+                    .control_transfer(
+                        &Request::get_configuration_descriptor(0, cfg.total_length),
+                        &mut buf,
+                        handle.max_packet_size,
+                    )
+                    .await
+            );
+            // TODO should probably iterate through the descriptor
+            let mut cfg_buf = &buf[..len];
+            while !cfg_buf.is_empty() {
+                trace!("{}", cfg_buf);
+                let desc = parse_descriptor(cfg_buf).map_err(|e| UsbHostError::ParsingError(e))?;
+                let len = match desc {
+                    Descriptor::Device(device_descriptor) => device_descriptor.length,
+                    Descriptor::Configuration(configuration_descriptor) => {
+                        configuration_descriptor.length
+                    }
+                    Descriptor::Endpoint(endpoint_descriptor) => {
+                        // interview quality code
+                        // TODO needs to go into a separate polling task
+                        // for each port
+                        // GET_STATUS
+                        // SET_FEATURE
+                        loop {
+                            let mut in_buf: [u8; 64] = [0; 64];
+                            let in_buf_len = self
+                                .pipe
+                                .data_in(endpoint_descriptor.b_endpoint_address, &mut in_buf)
+                                .await;
+
+                            if let Ok(in_buf_len) = in_buf_len {
+                                trace!("{}", in_buf[..in_buf_len]);
+                                break;
+                            }
+                        }
+
+                        endpoint_descriptor.b_length
+                    }
+                    Descriptor::Interface(interface_descriptor) => interface_descriptor.b_length,
+                } as usize;
+
+                cfg_buf = &cfg_buf[len..];
+            }
+
+            // enable ports
+
+            Ok(())
+        } else {
+            Err(UsbHostError::InvalidState)
+        }
+    }
+
     pub async fn run_until_suspend(&mut self) {
         loop {
             let state = core::mem::replace(&mut self.state, HostState::Disconnected);
