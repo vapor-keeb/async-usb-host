@@ -56,17 +56,33 @@ impl Request {
         }
     }
 
-    pub fn get_status(recepient: RequestTypeRecipient, value: u16, index: u16, length: u16) -> Request {
+    pub fn get_status(recepient: RequestTypeRecipient, request_type_type: RequestTypeType, value: u16, index: u16, length: u16) -> Request {
         Request {
             request_type: {
                 let mut t = RequestType::default();
                 t.set_data_direction(RequestTypeDirection::DeviceToHost);
-                t.set_type(RequestTypeType::Standard);
+                t.set_type(request_type_type);
                 t.set_recipient(recepient);
                 t
             },
             request: StandardDeviceRequest::GetStatus as u8,
             value: value,
+            index: index,
+            length: length,
+        }
+    }
+
+    pub fn set_feature(recepient: RequestTypeRecipient, request_type_type: RequestTypeType, feature: u16, index: u16, length: u16) -> Request {
+        Request {
+            request_type: {
+                let mut t = RequestType::default();
+                t.set_data_direction(RequestTypeDirection::HostToDevice);
+                t.set_type(request_type_type);
+                t.set_recipient(recepient);
+                t
+            },
+            request: StandardDeviceRequest::SetFeature as u8,
+            value: feature,
             index: index,
             length: length,
         }

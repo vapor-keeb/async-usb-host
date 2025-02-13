@@ -10,5 +10,6 @@ pub enum UsbHostError {
     BufferOverflow,
     ParsingError(ParsingError),
     TransferTimeout,
-    InvalidState
+    InvalidState,
+    InvalidResponse,
 }

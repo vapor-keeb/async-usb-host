@@ -1,6 +1,6 @@
 use defmt::Format;
 
-use crate::types::Bcd16;
+use crate::{errors::UsbHostError, types::Bcd16};
 
 pub mod hub;
 
@@ -40,6 +40,33 @@ pub enum Descriptor<'d> {
     Interface(&'d InterfaceDescriptor),
 }
 
+impl<'a> Descriptor<'a> {
+    pub fn device(self) -> Option<&'a DeviceDescriptor> {
+        match self {
+            Descriptor::Device(dev) => Some(dev),
+            _ => None,
+        }
+    }
+    pub fn configuration(self) -> Option<&'a ConfigurationDescriptor> {
+        match self {
+            Descriptor::Configuration(conf) => Some(conf),
+            _ => None,
+        }
+    }
+    pub fn endpoint(self) -> Option<&'a EndpointDescriptor> {
+        match self {
+            Descriptor::Endpoint(ep) => Some(ep),
+            _ => None,
+        }
+    }
+    pub fn interface(self) -> Option<&'a InterfaceDescriptor> {
+        match self {
+            Descriptor::Interface(intf) => Some(intf),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
@@ -50,27 +77,33 @@ pub enum ParsingError {
     UnknownType(u8),
 }
 
-pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingError> {
+impl Into<UsbHostError> for ParsingError {
+    fn into(self) -> UsbHostError {
+        UsbHostError::ParsingError(self)
+    }
+}
+
+pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, UsbHostError> {
     #[cfg(not(target_endian = "little"))]
     compile_error!("This function only works for little endian architechture");
 
     if buf.len() < core::mem::size_of::<DescriptorHeader>() {
-        return Err(ParsingError::Incomplete);
+        return Err(ParsingError::Incomplete.into());
     }
     // SAFETY: [`DescriptorHeader`] is packed, does not require alignment,
     // size is checked above
     let header: &'a DescriptorHeader = unsafe { core::mem::transmute(buf.as_ptr()) };
     let desc_type = DescriptorType::try_from(header.descriptor_type)
-        .map_err(|_| ParsingError::UnknownType(header.descriptor_type))?;
+        .map_err(|_| ParsingError::UnknownType(header.descriptor_type).into())?;
     match desc_type {
         DescriptorType::Device => {
             if header.length as usize != core::mem::size_of::<DeviceDescriptor>() {
-                Err(ParsingError::InvalidLength)
+                Err(ParsingError::InvalidLength.into())
             } else if buf.len()
                 < core::mem::offset_of!(DeviceDescriptor, max_packet_size)
                     + core::mem::size_of::<u8>()
             {
-                Err(ParsingError::Incomplete)
+                Err(ParsingError::Incomplete.into())
             } else {
                 // SAFETY: the transmute itself is unsafe. But in the `if` branch
                 // we are guaranteed that DeviceDescriptor::max_packet_size is at least
@@ -81,7 +114,8 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
                     if buf.len() < header.length as usize {
                         Err(ParsingError::IncompleteDeviceDescriptor {
                             max_packet_size: dev_desc.max_packet_size,
-                        })
+                        }
+                        .into())
                     } else {
                         debug_assert!(
                             header.length as usize == core::mem::size_of::<DeviceDescriptor>()
@@ -93,7 +127,7 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
         }
         DescriptorType::Configuration => {
             if buf.len() < core::mem::size_of::<ConfigurationDescriptor>() {
-                Err(ParsingError::Incomplete)
+                Err(ParsingError::Incomplete.into())
             } else {
                 Ok(Descriptor::Configuration(unsafe {
                     core::mem::transmute(buf.as_ptr())
@@ -103,7 +137,7 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
         DescriptorType::String => panic!(),
         DescriptorType::Interface => {
             if buf.len() < core::mem::size_of::<InterfaceDescriptor>() {
-                Err(ParsingError::Incomplete)
+                Err(ParsingError::Incomplete.into())
             } else {
                 Ok(Descriptor::Interface(unsafe {
                     core::mem::transmute(buf.as_ptr())
@@ -112,7 +146,7 @@ pub fn parse_descriptor<'a>(buf: &'a [u8]) -> Result<Descriptor<'a>, ParsingErro
         }
         DescriptorType::Endpoint => {
             if buf.len() < core::mem::size_of::<EndpointDescriptor>() {
-                Err(ParsingError::Incomplete)
+                Err(ParsingError::Incomplete.into())
             } else {
                 Ok(Descriptor::Endpoint(unsafe {
                     core::mem::transmute(buf.as_ptr())

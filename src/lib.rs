@@ -291,16 +291,9 @@ impl<D: Driver> PipeWrap<D> {
         self.data_out(0, &[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
-        match parse_descriptor(buf) {
-            Ok(desc) => {
-                if let descriptor::Descriptor::Device(dev_desc) = desc {
-                    Ok(dev_desc)
-                } else {
-                    Err(UsbHostError::Unknown)
-                }
-            }
-            Err(e) => Err(UsbHostError::ParsingError(e)),
-        }
+        let dev_desc = parse_descriptor(buf)
+            .and_then(|desc| desc.device().ok_or(UsbHostError::InvalidResponse))?;
+        Ok(dev_desc)
     }
 
     async fn control_transfer(
@@ -444,53 +437,8 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         handle: DeviceHandle,
         descriptor: DeviceDescriptor,
     ) -> Result<(), UsbHostError> {
-        let mut hub_desc = HubDescriptor::default();
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(
-                &raw mut hub_desc as *mut u8,
-                core::mem::size_of::<HubDescriptor>(),
-            )
-        };
         // TODO maybe control_transfer should just take an address
         self.pipe.set_addr(handle.address);
-        self.pipe
-            .control_transfer(
-                &Request::get_descriptor(
-                    0x29, // Hub Descriptor
-                    request::RequestTypeType::Class,
-                    0,
-                    0,
-                    buf.len() as u16,
-                ),
-                buf,
-                handle.max_packet_size,
-            )
-            .await?;
-
-        debug!("hub descriptor: {:?}", hub_desc);
-
-        for port in 0..hub_desc.number_of_ports {
-            let mut port_status = [0u8; 4];
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(
-                    &raw mut port_status as *mut u8,
-                    core::mem::size_of::<[u8; 4]>(),
-                )
-            };
-            self.pipe
-                .control_transfer(
-                    &Request::get_status(
-                        request::RequestTypeRecipient::Other,
-                        0,
-                        port as u16,
-                        buf.len() as u16,
-                    ),
-                    buf,
-                    handle.max_packet_size,
-                )
-                .await?;
-            debug!("port status {}: {:?}", port, port_status);
-        }
 
         // Pull Configuraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
@@ -506,70 +454,124 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                 )
                 .await
         );
-        let cfg = parse_descriptor(&buf[..len]).map_err(|e| UsbHostError::ParsingError(e))?;
-
+        let cfg = parse_descriptor(&buf[..len])
+            .and_then(|desc| desc.configuration().ok_or(UsbHostError::InvalidResponse))?
+            .clone();
         trace!("configuration recv {} bytes: {:?}", len, cfg);
-        if let Descriptor::Configuration(cfg) = cfg {
+        // set config
+        self.pipe
+            .control_transfer(
+                &Request::set_configuration(cfg.value),
+                &mut [],
+                handle.max_packet_size,
+            )
+            .await?;
+
+        let mut hub_desc = HubDescriptor::default();
+        let hub_desc_buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                &raw mut hub_desc as *mut u8,
+                core::mem::size_of::<HubDescriptor>(),
+            )
+        };
+        self.pipe
+            .control_transfer(
+                &Request::get_descriptor(
+                    0x29, // Hub Descriptor
+                    request::RequestTypeType::Class,
+                    0,
+                    0,
+                    hub_desc_buf.len() as u16,
+                ),
+                hub_desc_buf,
+                handle.max_packet_size,
+            )
+            .await?;
+
+        debug!("hub descriptor: {:?}", hub_desc);
+
+        // enable ports
+        for port in 1..=hub_desc.number_of_ports {
             self.pipe
                 .control_transfer(
-                    &Request::set_configuration(cfg.value),
+                    &Request::set_feature(
+                        request::RequestTypeRecipient::Other,
+                        request::RequestTypeType::Class,
+                        8, // Port Power
+                        port as u16,
+                        0,
+                    ),
                     &mut [],
                     handle.max_packet_size,
                 )
                 .await?;
-            // get configuration descriptor again with the proper len
-            let len = unwrap!(
-                self.pipe
-                    .control_transfer(
-                        &Request::get_configuration_descriptor(0, cfg.total_length),
-                        &mut buf,
-                        handle.max_packet_size,
-                    )
-                    .await
-            );
-            // TODO should probably iterate through the descriptor
-            let mut cfg_buf = &buf[..len];
-            while !cfg_buf.is_empty() {
-                trace!("{}", cfg_buf);
-                let desc = parse_descriptor(cfg_buf).map_err(|e| UsbHostError::ParsingError(e))?;
-                let len = match desc {
-                    Descriptor::Device(device_descriptor) => device_descriptor.length,
-                    Descriptor::Configuration(configuration_descriptor) => {
-                        configuration_descriptor.length
-                    }
-                    Descriptor::Endpoint(endpoint_descriptor) => {
-                        // interview quality code
-                        // TODO needs to go into a separate polling task
-                        // for each port
-                        // GET_STATUS
-                        // SET_FEATURE
-                        loop {
-                            let mut in_buf: [u8; 64] = [0; 64];
-                            let in_buf_len = self
-                                .pipe
-                                .data_in(endpoint_descriptor.b_endpoint_address, &mut in_buf)
-                                .await;
-
-                            if let Ok(in_buf_len) = in_buf_len {
-                                trace!("{}", in_buf[..in_buf_len]);
-                                break;
-                            }
-                        }
-
-                        endpoint_descriptor.b_length
-                    }
-                    Descriptor::Interface(interface_descriptor) => interface_descriptor.b_length,
-                } as usize;
-
-                cfg_buf = &cfg_buf[len..];
-            }
-
-            // enable ports
-
-            Ok(())
-        } else {
-            Err(UsbHostError::InvalidState)
         }
+
+        for port in 1..=hub_desc.number_of_ports {
+            let mut port_status = [0u8; 4];
+            self.pipe
+                .control_transfer(
+                    &Request::get_status(
+                        request::RequestTypeRecipient::Other,
+                        request::RequestTypeType::Class,
+                        0,
+                        port as u16,
+                        port_status.len() as u16,
+                    ),
+                    &mut port_status,
+                    handle.max_packet_size,
+                )
+                .await?;
+            debug!("port status {}: {:?}", port, port_status);
+        }
+
+        // get configuration descriptor again with the proper len
+        let len = unwrap!(
+            self.pipe
+                .control_transfer(
+                    &Request::get_configuration_descriptor(0, cfg.total_length),
+                    &mut buf,
+                    handle.max_packet_size,
+                )
+                .await
+        );
+        // TODO should probably iterate through the descriptor
+        let mut cfg_buf = &buf[..len];
+        while !cfg_buf.is_empty() {
+            let desc = parse_descriptor(cfg_buf)?;
+            let len = match desc {
+                Descriptor::Device(device_descriptor) => device_descriptor.length,
+                Descriptor::Configuration(configuration_descriptor) => {
+                    configuration_descriptor.length
+                }
+                Descriptor::Endpoint(endpoint_descriptor) => {
+                    // interview quality code
+                    // TODO needs to go into a separate polling task
+                    // for each port
+                    // GET_STATUS
+                    // SET_FEATURE
+                    loop {
+                        let mut in_buf: [u8; 64] = [0; 64];
+                        let in_buf_len = self
+                            .pipe
+                            .data_in(endpoint_descriptor.b_endpoint_address, &mut in_buf)
+                            .await;
+
+                        if let Ok(in_buf_len) = in_buf_len {
+                            trace!("{}", in_buf[..in_buf_len]);
+                            break;
+                        }
+                    }
+
+                    endpoint_descriptor.b_length
+                }
+                Descriptor::Interface(interface_descriptor) => interface_descriptor.b_length,
+            } as usize;
+
+            cfg_buf = &cfg_buf[len..];
+        }
+
+        Ok(())
     }
 
     pub async fn run_until_suspend(&mut self) {
