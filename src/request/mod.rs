@@ -56,6 +56,22 @@ impl Request {
         }
     }
 
+    pub fn get_status(recepient: RequestTypeRecipient, value: u16, index: u16, length: u16) -> Request {
+        Request {
+            request_type: {
+                let mut t = RequestType::default();
+                t.set_data_direction(RequestTypeDirection::DeviceToHost);
+                t.set_type(RequestTypeType::Standard);
+                t.set_recipient(recepient);
+                t
+            },
+            request: StandardDeviceRequest::GetStatus as u8,
+            value: value,
+            index: index,
+            length: length,
+        }
+    }
+
     pub fn get_configuration_descriptor(index: u8, length: u16) -> Request {
         Self::get_descriptor(
             DescriptorType::Configuration as u8,

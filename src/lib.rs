@@ -469,6 +469,30 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
 
         debug!("hub descriptor: {:?}", hub_desc);
 
+        for port in 0..hub_desc.number_of_ports {
+            let mut port_status = [0u8; 4];
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    &raw mut port_status as *mut u8,
+                    core::mem::size_of::<[u8; 4]>(),
+                )
+            };
+            self.pipe
+                .control_transfer(
+                    &Request::get_status(
+                        request::RequestTypeRecipient::Other,
+                        0,
+                        port as u16,
+                        buf.len() as u16,
+                    ),
+                    buf,
+                    handle.max_packet_size,
+                )
+                .await?;
+            debug!("port status {}: {:?}", port, port_status);
+        }
+
+        // Pull Configuraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
         let len = unwrap!(
             self.pipe
