@@ -167,6 +167,7 @@ pub struct Host<'a, D: Driver, const NR_CLIENTS: usize> {
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy)]
 pub struct DeviceHandle {
     address: u8,
     max_packet_size: u8,
@@ -298,15 +299,17 @@ impl<D: Driver> PipeWrap<D> {
 
     async fn control_transfer(
         &mut self,
+        device_handle: DeviceHandle,
         request: &Request,
         buffer: &mut [u8],
-        max_packet_size: u8,
     ) -> Result<usize, UsbHostError> {
         use request::RequestTypeDirection;
         let dir = request.request_type.data_direction();
         let mut bytes_received = 0usize;
 
         debug_assert!(buffer.len() >= request.length as usize);
+
+        self.set_addr(device_handle.address);
 
         // Setup stage
         self.setup(request).await?;
@@ -318,7 +321,7 @@ impl<D: Driver> PipeWrap<D> {
                 RequestTypeDirection::DeviceToHost => loop {
                     let len = self.data_in(0, &mut buffer[bytes_received..]).await?;
                     bytes_received += len;
-                    if len < max_packet_size as usize {
+                    if len < device_handle.max_packet_size as usize {
                         break;
                     }
                 },
@@ -437,20 +440,17 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         handle: DeviceHandle,
         descriptor: DeviceDescriptor,
     ) -> Result<(), UsbHostError> {
-        // TODO maybe control_transfer should just take an address
-        self.pipe.set_addr(handle.address);
-
         // Pull Configuraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
         let len = unwrap!(
             self.pipe
                 .control_transfer(
+                    handle,
                     &Request::get_configuration_descriptor(
                         0,
                         core::mem::size_of::<ConfigurationDescriptor>() as u16
                     ),
                     &mut buf,
-                    handle.max_packet_size,
                 )
                 .await
         );
@@ -460,11 +460,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         trace!("configuration recv {} bytes: {:?}", len, cfg);
         // set config
         self.pipe
-            .control_transfer(
-                &Request::set_configuration(cfg.value),
-                &mut [],
-                handle.max_packet_size,
-            )
+            .control_transfer(handle, &Request::set_configuration(cfg.value), &mut [])
             .await?;
 
         let mut hub_desc = HubDescriptor::default();
@@ -476,6 +472,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         };
         self.pipe
             .control_transfer(
+                handle,
                 &Request::get_descriptor(
                     0x29, // Hub Descriptor
                     request::RequestTypeType::Class,
@@ -484,7 +481,6 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                     hub_desc_buf.len() as u16,
                 ),
                 hub_desc_buf,
-                handle.max_packet_size,
             )
             .await?;
 
@@ -494,6 +490,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         for port in 1..=hub_desc.number_of_ports {
             self.pipe
                 .control_transfer(
+                    handle,
                     &Request::set_feature(
                         request::RequestTypeRecipient::Other,
                         request::RequestTypeType::Class,
@@ -502,7 +499,6 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                         0,
                     ),
                     &mut [],
-                    handle.max_packet_size,
                 )
                 .await?;
         }
@@ -511,6 +507,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
             let mut port_status = [0u8; 4];
             self.pipe
                 .control_transfer(
+                    handle,
                     &Request::get_status(
                         request::RequestTypeRecipient::Other,
                         request::RequestTypeType::Class,
@@ -519,7 +516,6 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                         port_status.len() as u16,
                     ),
                     &mut port_status,
-                    handle.max_packet_size,
                 )
                 .await?;
             debug!("port status {}: {:?}", port, port_status);
@@ -529,9 +525,9 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         let len = unwrap!(
             self.pipe
                 .control_transfer(
+                    handle,
                     &Request::get_configuration_descriptor(0, cfg.total_length),
                     &mut buf,
-                    handle.max_packet_size,
                 )
                 .await
         );
@@ -601,10 +597,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                             if (client.accept_device)(&descriptor) {
                                 client
                                     .host2client
-                                    .send(Host2ClientMessage::NewDevice {
-                                        descriptor: descriptor,
-                                        handle: handle,
-                                    })
+                                    .send(Host2ClientMessage::NewDevice { descriptor, handle })
                                     .await;
                                 accepted = true;
                                 break;
@@ -642,7 +635,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                         self.pipe.set_addr(dev_handle.address);
                         let result = self
                             .pipe
-                            .control_transfer(&request, buffer, dev_handle.max_packet_size)
+                            .control_transfer(dev_handle, &request, buffer)
                             .await;
                         self.clients[client_id]
                             .host2client
