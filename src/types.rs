@@ -96,3 +96,40 @@ impl TryFrom<u8> for Pid {
         }
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum EndpointDirection {
+    In,
+    Out,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EndpointAddress {
+    pub number: u8,
+    pub direction: EndpointDirection,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct EndpointState {
+    pub endpoint_address: EndpointAddress,
+    tog: DataTog,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DataTog {
+    DATA0,
+    DATA1,
+}
+
+impl DataTog {
+    pub fn next(&mut self) {
+        *self = match self {
+            DataTog::DATA0 => DataTog::DATA1,
+            DataTog::DATA1 => DataTog::DATA0,
+        };
+    }
+}

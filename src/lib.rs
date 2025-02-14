@@ -14,6 +14,7 @@ use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
 use request::{Request, RequestType, StandardDeviceRequest};
+use types::{DataTog, EndpointAddress, Pid};
 
 pub mod consts;
 pub mod descriptor;
@@ -51,8 +52,18 @@ pub trait Pipe {
     /// When setup is called, it should send a setup request, also setup the
     /// hardware to send / expect DATA1 packets on subsequent data_in / data_out
     async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError>;
-    async fn data_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbHostError>;
-    async fn data_out(&mut self, endpoint: u8, buf: &[u8]) -> Result<(), UsbHostError>;
+    async fn data_in(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &mut [u8],
+    ) -> Result<usize, UsbHostError>;
+    async fn data_out(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &[u8],
+    ) -> Result<(), UsbHostError>;
 }
 
 pub trait Driver {
@@ -94,6 +105,11 @@ pub enum Client2HostMessage {
         request: Request,
         buffer: &'static mut [u8],
     },
+    InterruptTransfer {
+        dev_handle: DeviceHandle,
+        endpoint_address: EndpointAddress,
+        buffer: &'static mut [u8],
+    },
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -103,6 +119,10 @@ pub enum Host2ClientMessage {
         handle: DeviceHandle,
     },
     ControlTransferResponse {
+        result: Result<usize, UsbHostError>,
+        buffer: &'static mut [u8],
+    },
+    InterruptTransferResponse {
         result: Result<usize, UsbHostError>,
         buffer: &'static mut [u8],
     },
@@ -129,6 +149,32 @@ impl HostHandle {
 
     pub async fn recv(&self) -> Host2ClientMessage {
         self.host2client.receive().await
+    }
+
+    pub async fn interrupt_transfer(
+        &self,
+        dev_handle: DeviceHandle,
+        endpoint_address: EndpointAddress,
+        buffer: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
+        hot_potato::toss_potato_async(buffer, async |potate| {
+            self.client2host
+                .send(Client2HostMessage::InterruptTransfer {
+                    dev_handle,
+                    endpoint_address,
+                    buffer: potate,
+                })
+                .await;
+
+            let result = self.host2client.receive().await;
+            match result {
+                Host2ClientMessage::InterruptTransferResponse { result, buffer } => {
+                    (buffer, result)
+                }
+                _ => panic!(),
+            }
+        })
+        .await
     }
 
     pub async fn control_transfer(
@@ -185,10 +231,15 @@ impl<D: Driver> PipeWrap<D> {
         }
     }
 
-    async fn data_in(&mut self, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbHostError> {
+    async fn data_in(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         let mut data_in_with_retry = async || loop {
-            match self.0.data_in(endpoint, buf).await {
+            match self.0.data_in(endpoint, tog, buf).await {
                 Ok(size) => return Ok(size),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -205,10 +256,15 @@ impl<D: Driver> PipeWrap<D> {
         }
     }
 
-    async fn data_out(&mut self, endpoint: u8, buf: &[u8]) -> Result<(), UsbHostError> {
+    async fn data_out(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &[u8],
+    ) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         // TODO retry like data_in
-        let data_fut = self.0.data_out(endpoint, buf);
+        let data_fut = self.0.data_out(endpoint, tog, buf);
         match select(timeout_fut, data_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
@@ -237,7 +293,7 @@ impl<D: Driver> PipeWrap<D> {
         // Setup stage
         self.setup(&request).await?;
         // Status stage (no data)
-        self.data_in(0, &mut []).await?;
+        self.data_in(0, DataTog::DATA1, &mut []).await?;
 
         Ok(())
     }
@@ -265,9 +321,11 @@ impl<D: Driver> PipeWrap<D> {
         self.setup(&request).await?;
         trace!("setup finished");
 
+        let mut tog = DataTog::DATA1;
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = self.data_in(0, buf).await?;
+        let in_result = self.data_in(0, tog, buf).await?;
+        tog.next();
         bytes_read += in_result;
 
         while bytes_read < core::mem::size_of::<DeviceDescriptor>() {
@@ -278,18 +336,19 @@ impl<D: Driver> PipeWrap<D> {
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
             let in_result = self
-                .data_in(0, unsafe {
+                .data_in(0, tog, unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
                         chopped_off_buf.len(),
                     )
                 })
                 .await?;
+            tog.next();
             bytes_read += in_result;
         }
 
         // Status stage
-        self.data_out(0, &[]).await?;
+        self.data_out(0, DataTog::DATA1, &[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         let dev_desc = parse_descriptor(buf)
@@ -318,23 +377,27 @@ impl<D: Driver> PipeWrap<D> {
         if request.length > 0 {
             match dir {
                 RequestTypeDirection::HostToDevice => todo!(),
-                RequestTypeDirection::DeviceToHost => loop {
-                    let len = self.data_in(0, &mut buffer[bytes_received..]).await?;
-                    bytes_received += len;
-                    if len < device_handle.max_packet_size as usize {
-                        break;
+                RequestTypeDirection::DeviceToHost => {
+                    let mut tog = DataTog::DATA1;
+                    loop {
+                        let len = self.data_in(0, tog, &mut buffer[bytes_received..]).await?;
+                        tog.next();
+                        bytes_received += len;
+                        if len < device_handle.max_packet_size as usize {
+                            break;
+                        }
                     }
-                },
+                }
             }
         }
 
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                self.data_in(0, &mut []).await?;
+                self.data_in(0, DataTog::DATA1, &mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                self.data_out(0, &[]).await?;
+                self.data_out(0, DataTog::DATA1, &[]).await?;
             }
         }
 
@@ -550,9 +613,8 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                         let mut in_buf: [u8; 64] = [0; 64];
                         let in_buf_len = self
                             .pipe
-                            .data_in(endpoint_descriptor.b_endpoint_address, &mut in_buf)
+                            .data_in(endpoint_descriptor.b_endpoint_address, DataTog::DATA0, &mut in_buf)
                             .await;
-
                         if let Ok(in_buf_len) = in_buf_len {
                             trace!("{}", in_buf[..in_buf_len]);
                             break;
@@ -642,6 +704,11 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                             .send(Host2ClientMessage::ControlTransferResponse { result, buffer })
                             .await;
                     }
+                    Client2HostMessage::InterruptTransfer {
+                        dev_handle,
+                        endpoint_address,
+                        buffer,
+                    } => todo!(),
                 }
                 HostState::Idle
             }
