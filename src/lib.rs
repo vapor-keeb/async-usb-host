@@ -584,6 +584,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
     }
 
     async fn run_disconnected(bus: &mut BusWrap<D>) -> HostState {
+        // TODO free all addresses.
         let event = bus.0.poll().await;
         Self::handle_bus_event(bus, event).await
     }
