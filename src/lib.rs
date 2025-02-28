@@ -1,6 +1,10 @@
 #![no_std]
 use core::{
-    array, cell::RefCell, future::Future, marker::PhantomData, mem::transmute, pin::Pin, task::Poll,
+    future::Future,
+    marker::PhantomData,
+    mem::transmute,
+    pin::{pin, Pin},
+    task::Poll,
 };
 
 use arrayvec::ArrayVec;
@@ -16,12 +20,13 @@ use embassy_sync::{
 use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
+use rename_future::rename_future;
 use request::{Request, RequestType, StandardDeviceRequest};
 use types::{DataTog, EndpointAddress, InterruptChannel, Pid};
 
 pub mod consts;
 pub mod descriptor;
-pub mod driver;
+// pub mod driver;
 pub mod errors;
 mod futures;
 mod hot_potato;
@@ -77,12 +82,17 @@ pub trait Driver {
     fn start(self) -> (Self::Bus, Self::Pipe);
 }
 
+struct InterruptTransfer<'a> {
+    channel: InterruptChannel,
+    buffer: &'a mut [u8],
+}
+
 pub enum HostState<'a, const NR_PENDING_TRANSFERS: usize> {
     Initializing,
     Disconnected,
     DeviceEnumerate,
     DeviceAttached {
-        interrupt_transfers: ArrayVec<(InterruptChannel, &'a mut [u8]), NR_PENDING_TRANSFERS>,
+        interrupt_transfers: ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>,
     },
     Suspended,
 }
@@ -122,7 +132,7 @@ pub enum Host2ClientMessage {
 pub struct Host<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize> {
     phantom: PhantomData<D>,
     bus: BusWrap<D>,
-    pipe: RefCell<PipeWrap<D>>,
+    pipe: PipeWrap<D>,
     state: HostState<'a, NR_PENDING_TRANSFERS>,
     address_alloc: DeviceAddressAllocator,
 }
@@ -369,26 +379,6 @@ impl<D: Driver> PipeWrap<D> {
     }
 }
 
-struct InterruptTransfer<'a, D: Driver> {
-    channel: InterruptChannel,
-    buffer: &'a mut [u8],
-    pipe: &'a RefCell<PipeWrap<D>>,
-}
-
-impl<D: Driver> Future for InterruptTransfer<'_, D> {
-    type Output = Result<(usize), UsbHostError>;
-
-    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let pipe = this.pipe.borrow_mut();
-        let fut = pipe.try_interrupt_transfer(this.channel, this.buffer);
-        {
-            // left off here!!!
-            fut.poll(cx)
-        }
-    }
-}
-
 struct BusWrap<D: Driver>(D::Bus);
 
 struct DeviceAddressAllocator([u8; 16]);
@@ -449,7 +439,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
 
         Host {
             bus: BusWrap(bus),
-            pipe: RefCell::new(PipeWrap(pipe)),
+            pipe: PipeWrap(pipe),
             address_alloc: DeviceAddressAllocator::new(),
             state: HostState::Initializing,
             phantom: PhantomData,
@@ -467,7 +457,6 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
         } = self.state
         {
             self.pipe
-                .borrow_mut()
                 .control_transfer(dev_handle, &request, buffer)
                 .await
         } else {
@@ -485,8 +474,11 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
         } = self.state
         {
             interrupt_transfers
-                .try_push((interrupt_channel, buffer))
-                .map_err(|cap| UsbHostError::InterruptTransferCapacity(cap.element().0))
+                .try_push(InterruptTransfer {
+                    channel: interrupt_channel,
+                    buffer,
+                })
+                .map_err(|cap| UsbHostError::InterruptTransferCapacity(cap.element().channel))
         } else {
             return Err(UsbHostError::InvalidState);
         }
@@ -526,7 +518,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
         }
     }
 
-    async fn run_device_attached(&mut self) -> HostState<'a, NR_PENDING_TRANSFERS> {
+    async fn run_device_attached(&mut self, interrupt_xfer: ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>) -> HostState<'a, NR_PENDING_TRANSFERS> {
         let futures: [_; NR_CLIENTS] = array::from_fn(|i| self.clients[i].client2host.receive());
 
         let bus_fut = self.bus.0.poll();
@@ -542,13 +534,12 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
                     } => {
                         let result = self
                             .pipe
-                            .borrow_mut()
                             .control_transfer(dev_handle, &request, buffer)
                             .await;
-                        self.clients[client_id]
-                            .host2client
-                            .send(Host2ClientMessage::ControlTransferResponse { result, buffer })
-                            .await;
+                        // self.clients[client_id]
+                        //     .host2client
+                        //     .send(Host2ClientMessage::ControlTransferResponse { result, buffer })
+                        //     .await;
                     }
                     Client2HostMessage::InterruptTransfer {
                         dev_handle,
@@ -556,9 +547,20 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
                         buffer,
                     } => todo!(),
                 }
-                HostState::Idle
+                HostState::Suspended // TODO: garbage
             }
             Either::Second(bus_event) => Self::handle_bus_event(&mut self.bus, bus_event).await,
+        }
+    }
+
+    async fn run_interrupt_transfer(&mut self, interrupt_xfer: &mut ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>) {
+        for t in interrupt_xfer {
+            match self.pipe.try_interrupt_transfer(&mut t.channel, t.buffer).await {
+                Ok(_) => return, // TODO: Do something? maybe
+                Err(_) => {
+                    // nothing to do try again LOL
+                },
+            }
         }
     }
 
