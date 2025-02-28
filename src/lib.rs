@@ -1,6 +1,9 @@
 #![no_std]
-use core::{array, future::Future, marker::PhantomData, mem::transmute, task::Poll};
+use core::{
+    array, cell::RefCell, future::Future, marker::PhantomData, mem::transmute, pin::Pin, task::Poll,
+};
 
+use arrayvec::ArrayVec;
 use consts::UsbBaseClass;
 use descriptor::{
     hub::HubDescriptor, parse_descriptor, ConfigurationDescriptor, Descriptor, DescriptorType,
@@ -14,17 +17,17 @@ use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
 use request::{Request, RequestType, StandardDeviceRequest};
-use types::{DataTog, EndpointAddress, Pid};
+use types::{DataTog, EndpointAddress, InterruptChannel, Pid};
 
 pub mod consts;
 pub mod descriptor;
+pub mod driver;
 pub mod errors;
 mod futures;
 mod hot_potato;
 mod macros;
 pub mod request;
 pub mod types;
-pub mod driver;
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -74,28 +77,14 @@ pub trait Driver {
     fn start(self) -> (Self::Bus, Self::Pipe);
 }
 
-pub enum HostState {
+pub enum HostState<'a, const NR_PENDING_TRANSFERS: usize> {
     Initializing,
     Disconnected,
     DeviceEnumerate,
     DeviceAttached {
-        handle: DeviceHandle,
-        descriptor: DeviceDescriptor,
+        interrupt_transfers: ArrayVec<(InterruptChannel, &'a mut [u8]), NR_PENDING_TRANSFERS>,
     },
-    Idle,
     Suspended,
-}
-
-pub struct HostControl {
-    signal: Signal<CriticalSectionRawMutex, bool>,
-}
-
-impl HostControl {
-    pub const fn new() -> Self {
-        HostControl {
-            signal: Signal::new(),
-        }
-    }
 }
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -127,89 +116,14 @@ pub enum Host2ClientMessage {
         result: Result<usize, UsbHostError>,
         buffer: &'static mut [u8],
     },
+    Suspended,
 }
 
-pub struct HostHandle {
-    host2client: Channel<CriticalSectionRawMutex, Host2ClientMessage, 1>,
-    client2host: Channel<CriticalSectionRawMutex, Client2HostMessage, 1>,
-    accept_device: fn(desc: &DeviceDescriptor) -> bool,
-}
-
-impl HostHandle {
-    pub const fn new(accept_device: fn(desc: &DeviceDescriptor) -> bool) -> Self {
-        HostHandle {
-            host2client: Channel::new(),
-            client2host: Channel::new(),
-            accept_device,
-        }
-    }
-
-    pub async fn register(&self) {
-        self.client2host.send(Client2HostMessage::ClientReady).await;
-    }
-
-    pub async fn recv(&self) -> Host2ClientMessage {
-        self.host2client.receive().await
-    }
-
-    pub async fn interrupt_transfer(
-        &self,
-        dev_handle: DeviceHandle,
-        endpoint_address: EndpointAddress,
-        buffer: &mut [u8],
-    ) -> Result<usize, UsbHostError> {
-        hot_potato::toss_potato_async(buffer, async |potate| {
-            self.client2host
-                .send(Client2HostMessage::InterruptTransfer {
-                    dev_handle,
-                    endpoint_address,
-                    buffer: potate,
-                })
-                .await;
-
-            let result = self.host2client.receive().await;
-            match result {
-                Host2ClientMessage::InterruptTransferResponse { result, buffer } => {
-                    (buffer, result)
-                }
-                _ => panic!(),
-            }
-        })
-        .await
-    }
-
-    pub async fn control_transfer(
-        &self,
-        dev_handle: DeviceHandle,
-        request: Request,
-        buffer: &mut [u8],
-    ) -> Result<usize, UsbHostError> {
-        hot_potato::toss_potato_async(buffer, async |potate| {
-            self.client2host
-                .send(Client2HostMessage::ControlTransfer {
-                    dev_handle,
-                    request,
-                    buffer: potate,
-                })
-                .await;
-
-            let result = self.host2client.receive().await;
-            match result {
-                Host2ClientMessage::ControlTransferResponse { result, buffer } => (buffer, result),
-                _ => panic!(),
-            }
-        })
-        .await
-    }
-}
-
-pub struct Host<'a, D: Driver, const NR_CLIENTS: usize> {
+pub struct Host<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize> {
     phantom: PhantomData<D>,
-    host_control: &'a HostControl,
-    clients: [&'a HostHandle; NR_CLIENTS],
     bus: BusWrap<D>,
-    pipe: PipeWrap<D>,
-    state: HostState,
+    pipe: RefCell<PipeWrap<D>>,
+    state: HostState<'a, NR_PENDING_TRANSFERS>,
     address_alloc: DeviceAddressAllocator,
 }
 
@@ -357,6 +271,33 @@ impl<D: Driver> PipeWrap<D> {
         Ok(dev_desc)
     }
 
+    async fn try_interrupt_transfer(
+        &mut self,
+        interrupt_channel: &mut InterruptChannel,
+        buffer: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
+        let endpoint = interrupt_channel.endpoint_address.number;
+        let tog = interrupt_channel.tog;
+        let buf = buffer;
+        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+
+        let mut interrupt_transfer_with_retry = async || loop {
+            let res = match interrupt_channel.endpoint_address.direction {
+                types::EndpointDirection::In => self.0.data_in(endpoint, tog, buf).await,
+                types::EndpointDirection::Out => {
+                    self.0.data_out(endpoint, tog, buf).await.map(|_| 0)
+                }
+            }?;
+            interrupt_channel.tog.next();
+            return Ok(res);
+        };
+        let interrupt_transfer_fut = interrupt_transfer_with_retry();
+        match select(timeout_fut, interrupt_transfer_fut).await {
+            Either::First(_) => Err(UsbHostError::TransferTimeout),
+            Either::Second(r) => r,
+        }
+    }
+
     async fn control_transfer(
         &mut self,
         device_handle: DeviceHandle,
@@ -428,6 +369,26 @@ impl<D: Driver> PipeWrap<D> {
     }
 }
 
+struct InterruptTransfer<'a, D: Driver> {
+    channel: InterruptChannel,
+    buffer: &'a mut [u8],
+    pipe: &'a RefCell<PipeWrap<D>>,
+}
+
+impl<D: Driver> Future for InterruptTransfer<'_, D> {
+    type Output = Result<(usize), UsbHostError>;
+
+    fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let pipe = this.pipe.borrow_mut();
+        let fut = pipe.try_interrupt_transfer(this.channel, this.buffer);
+        {
+            // left off here!!!
+            fut.poll(cx)
+        }
+    }
+}
+
 struct BusWrap<D: Driver>(D::Bus);
 
 struct DeviceAddressAllocator([u8; 16]);
@@ -480,76 +441,94 @@ impl DeviceAddressAllocator {
     }
 }
 
-impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
-    pub fn new(
-        driver: D,
-        host_control: &'a HostControl,
-        clients: [&'a HostHandle; NR_CLIENTS],
-    ) -> Self {
+impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
+    Host<'a, D, NR_CLIENTS, NR_PENDING_TRANSFERS>
+{
+    pub fn new(driver: D) -> Self {
         let (bus, pipe) = driver.start();
 
         Host {
             bus: BusWrap(bus),
-            pipe: PipeWrap(pipe),
+            pipe: RefCell::new(PipeWrap(pipe)),
             address_alloc: DeviceAddressAllocator::new(),
-            host_control,
             state: HostState::Initializing,
-            clients,
             phantom: PhantomData,
         }
     }
 
-    pub async fn run_until_suspend(&mut self) {
+    pub async fn control_transfer(
+        &mut self,
+        dev_handle: DeviceHandle,
+        request: Request,
+        buffer: &'a mut [u8],
+    ) -> Result<usize, UsbHostError> {
+        if let HostState::DeviceAttached {
+            interrupt_transfers: _,
+        } = self.state
+        {
+            self.pipe
+                .borrow_mut()
+                .control_transfer(dev_handle, &request, buffer)
+                .await
+        } else {
+            return Err(UsbHostError::InvalidState);
+        }
+    }
+
+    pub async fn interrupt_transfer(
+        &mut self,
+        interrupt_channel: InterruptChannel,
+        buffer: &'a mut [u8],
+    ) -> Result<(), UsbHostError> {
+        if let HostState::DeviceAttached {
+            ref mut interrupt_transfers,
+        } = self.state
+        {
+            interrupt_transfers
+                .try_push((interrupt_channel, buffer))
+                .map_err(|cap| UsbHostError::InterruptTransferCapacity(cap.element().0))
+        } else {
+            return Err(UsbHostError::InvalidState);
+        }
+    }
+
+    pub async fn run_until_event(&mut self) -> Host2ClientMessage {
         loop {
             let state = core::mem::replace(&mut self.state, HostState::Disconnected);
             self.state = match state {
                 HostState::Initializing => {
-                    for client in self.clients.iter() {
-                        let packet = client.client2host.receive().await;
-                        if let Client2HostMessage::ClientReady = packet {
-                        } else {
-                            panic!("???");
-                        }
-                    }
                     info!("Driver ready!");
                     HostState::Disconnected
                 }
                 HostState::Disconnected => Self::run_disconnected(&mut self.bus).await,
-                HostState::DeviceEnumerate => self.run_enumerate().await,
-                HostState::DeviceAttached { handle, descriptor } => {
-                    if descriptor.device_class == UsbBaseClass::Hub.into() {
-                        unwrap!(driver::hub::register_hub(self, handle, descriptor).await);
+                HostState::DeviceEnumerate => {
+                    let (state, msg) = self.run_enumerate().await;
+                    if let Some(msg) = msg {
+                        self.state = state;
+                        return msg;
                     } else {
-                        let mut accepted = false;
-
-                        for client in self.clients {
-                            if (client.accept_device)(&descriptor) {
-                                client
-                                    .host2client
-                                    .send(Host2ClientMessage::NewDevice { descriptor, handle })
-                                    .await;
-                                accepted = true;
-                                break;
-                            }
-                        }
-                        trace!("device accepted?: {}", accepted);
+                        state
                     }
-
-                    HostState::Idle
                 }
-                HostState::Idle => self.run_idle().await,
+                HostState::DeviceAttached {
+                    interrupt_transfers,
+                } => {
+                    self.run_device_attached().await;
+                    HostState::DeviceAttached {
+                        interrupt_transfers,
+                    }
+                }
                 HostState::Suspended => {
                     self.state = HostState::Disconnected;
-                    break;
+                    return Host2ClientMessage::Suspended;
                 }
             }
         }
     }
 
-    async fn run_idle(&mut self) -> HostState {
+    async fn run_device_attached(&mut self) -> HostState<'a, NR_PENDING_TRANSFERS> {
         let futures: [_; NR_CLIENTS] = array::from_fn(|i| self.clients[i].client2host.receive());
 
-        let client_request_fut = select_array(futures);
         let bus_fut = self.bus.0.poll();
         match select(client_request_fut, bus_fut).await {
             Either::First((client_request, client_id)) => {
@@ -561,9 +540,9 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
                         request,
                         buffer,
                     } => {
-                        self.pipe.set_addr(dev_handle.address);
                         let result = self
                             .pipe
+                            .borrow_mut()
                             .control_transfer(dev_handle, &request, buffer)
                             .await;
                         self.clients[client_id]
@@ -583,13 +562,16 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         }
     }
 
-    async fn run_disconnected(bus: &mut BusWrap<D>) -> HostState {
+    async fn run_disconnected(bus: &mut BusWrap<D>) -> HostState<'a, NR_PENDING_TRANSFERS> {
         // TODO free all addresses.
         let event = bus.0.poll().await;
         Self::handle_bus_event(bus, event).await
     }
 
-    async fn handle_bus_event(bus: &mut BusWrap<D>, event: Event) -> HostState {
+    async fn handle_bus_event(
+        bus: &mut BusWrap<D>,
+        event: Event,
+    ) -> HostState<'a, NR_PENDING_TRANSFERS> {
         info!("event: {}", event);
         match event {
             Event::DeviceAttach => {
@@ -605,33 +587,49 @@ impl<'a, D: Driver, const NR_CLIENTS: usize> Host<'a, D, NR_CLIENTS> {
         }
     }
 
-    async fn run_enumerate(&mut self) -> HostState {
-        let pipe_future = self.pipe.dev_attach(&mut self.address_alloc);
+    async fn run_enumerate(
+        &mut self,
+    ) -> (
+        HostState<'a, NR_PENDING_TRANSFERS>,
+        Option<Host2ClientMessage>,
+    ) {
+        let pipe_future = self.pipe.borrow_mut().dev_attach(&mut self.address_alloc);
         let bus_future = self.bus.0.poll();
 
-        poll_select(pipe_future, bus_future, |either| match either {
+        let (state, opt) = poll_select(pipe_future, bus_future, |either| match either {
             futures::Either::First(device_result) => Poll::Ready(match device_result {
-                Ok((desc, dev_handle)) => {
-                    trace!("device attached!");
+                Ok((descriptor, handle)) => (
                     HostState::DeviceAttached {
-                        handle: dev_handle,
-                        descriptor: desc,
-                    }
-                }
+                        interrupt_transfers: ArrayVec::new(),
+                    },
+                    Some((descriptor, handle)),
+                ),
                 Err(e) => {
                     debug!("{}", e);
                     // TODO: restore to "previous state"
-                    HostState::Disconnected
+                    (HostState::Disconnected, None)
                 }
             }),
             futures::Either::Second(event) => {
                 info!("event: {}", event);
                 match event {
-                    Event::DeviceDetach => Poll::Ready(HostState::Disconnected),
+                    Event::DeviceDetach => Poll::Ready((HostState::Disconnected, None)),
                     _ => Poll::Pending,
                 }
             }
         })
-        .await
+        .await;
+        let msg = if let Some((descriptor, handle)) = opt {
+            trace!("device attached!");
+            if descriptor.device_class == UsbBaseClass::Hub.into() {
+                unwrap!(driver::hub::register_hub(self, handle, descriptor).await);
+                None
+            } else {
+                Some(Host2ClientMessage::NewDevice { descriptor, handle })
+            }
+        } else {
+            None
+        };
+        (state, msg)
     }
 }

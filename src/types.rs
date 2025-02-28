@@ -1,3 +1,5 @@
+use crate::DeviceHandle;
+
 /// Represents a 16-bit binary-coded-decimal value
 ///
 /// A 16-bit BCD represents 4 decimal digits (0-9).
@@ -111,11 +113,12 @@ pub struct EndpointAddress {
     pub direction: EndpointDirection,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct EndpointState {
-    pub endpoint_address: EndpointAddress,
-    tog: DataTog,
+pub struct InterruptChannel {
+    pub(crate) device_handle: DeviceHandle,
+    pub(crate) endpoint_address: EndpointAddress,
+    pub(crate) tog: DataTog,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

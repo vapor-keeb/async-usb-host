@@ -1,4 +1,4 @@
-use crate::descriptor::ParsingError;
+use crate::{descriptor::ParsingError, types::InterruptChannel};
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
@@ -12,4 +12,5 @@ pub enum UsbHostError {
     TransferTimeout,
     InvalidState,
     InvalidResponse,
+    InterruptTransferCapacity(InterruptChannel),
 }
