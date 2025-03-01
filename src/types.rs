@@ -101,6 +101,7 @@ impl TryFrom<u8> for Pid {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub enum EndpointDirection {
     In,
     Out,
@@ -108,6 +109,7 @@ pub enum EndpointDirection {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub struct EndpointAddress {
     pub number: u8,
     pub direction: EndpointDirection,
@@ -115,6 +117,7 @@ pub struct EndpointAddress {
 
 #[derive(Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub struct InterruptChannel {
     pub(crate) device_handle: DeviceHandle,
     pub(crate) endpoint_address: EndpointAddress,
@@ -123,6 +126,7 @@ pub struct InterruptChannel {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub enum DataTog {
     DATA0,
     DATA1,

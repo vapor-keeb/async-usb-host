@@ -171,6 +171,7 @@ impl RequestType {
     }
 }
 
+#[cfg(feature = "defmt")]
 impl defmt::Format for RequestType {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(

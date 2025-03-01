@@ -1,5 +1,3 @@
-use defmt::Format;
-
 use crate::{errors::UsbHostError, types::Bcd16};
 
 pub mod hub;
@@ -33,6 +31,7 @@ impl TryFrom<u8> for DescriptorType {
 
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub enum Descriptor<'d> {
     Device(&'d DeviceDescriptor),
     Configuration(&'d ConfigurationDescriptor),
@@ -269,6 +268,7 @@ impl defmt::Format for DeviceDescriptor {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[repr(transparent)]
 pub struct ConfigurationAttributes(u8);
 
@@ -306,6 +306,7 @@ impl defmt::Format for ConfigurationAttributes {
 /// The descriptor contains a bConfigurationValue field with a value that, when used as a parameter
 /// to the SetConfiguration() request, causes the device to assume the described configuration.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[cfg_attr(target_endian = "little", repr(C, packed))]
 pub struct ConfigurationDescriptor {
     pub length: u8,
@@ -357,7 +358,8 @@ impl defmt::Format for ConfigurationDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[repr(C, packed)]
 pub struct EndpointDescriptor {
     /// bLength
@@ -432,7 +434,8 @@ pub struct EndpointDescriptor {
 }
 
 /// NOT READ BY A HUMAN. 99% generated
-impl Format for EndpointDescriptor {
+#[cfg(feature = "defmt")]
+impl defmt::Format for EndpointDescriptor {
     fn format(&self, fmt: defmt::Formatter) {
         defmt::write!(fmt, "EndpointDescriptor {{");
         defmt::write!(fmt, ".b_length: {},", self.b_length);
@@ -494,7 +497,9 @@ impl Format for EndpointDescriptor {
 }
 
 #[repr(C, packed)]
-#[derive(Format, Copy, Clone)] // Derive Format for defmt, and other useful traits
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
+#[derive(Copy, Clone)] // Derive Format for defmt, and other useful traits
 pub struct InterfaceDescriptor {
     /// bLength - Size of this descriptor in bytes.
     pub b_length: u8,
