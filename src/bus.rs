@@ -14,10 +14,7 @@ pub enum Event {
 #[allow(async_fn_in_trait)]
 pub trait Bus {
     async fn reset(&mut self);
-    /// must be able to resume after completion
-    /// aka poll after returning Poll::Ready(_)
-    /// the built-in async keyword does not allow this
-    fn poll(&mut self) -> impl Future<Output = Event>;
+    async fn poll(&mut self) -> Event;
 }
 
 pub(crate) struct BusWrap<D: Driver>(D::Bus);
@@ -36,6 +33,15 @@ impl<D: Driver> BusWrap<D> {
                 Event::DeviceAttach
             }
             e => e,
+        }
+    }
+
+    pub async fn wait_until_detach(&mut self) {
+        loop {
+            match self.0.poll().await {
+                Event::DeviceDetach => return,
+                _ => {}
+            }
         }
     }
 }

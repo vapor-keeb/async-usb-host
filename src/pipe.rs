@@ -179,7 +179,7 @@ impl<D: Driver> PipeWrap<D> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
 
         self.set_addr(interrupt_channel.device_handle.address());
-        let mut interrupt_transfer = async || {
+        let mut interrupt_transfer_with_retry = async || {
             let res = match interrupt_channel.endpoint_address.direction {
                 types::EndpointDirection::In => self.0.data_in(endpoint, tog, buf).await,
                 types::EndpointDirection::Out => {
@@ -187,9 +187,9 @@ impl<D: Driver> PipeWrap<D> {
                 }
             }?;
             interrupt_channel.tog.next();
-            return Ok(res);
+            Ok(res)
         };
-        let interrupt_transfer_fut = interrupt_transfer();
+        let interrupt_transfer_fut = interrupt_transfer_with_retry();
         match select(timeout_fut, interrupt_transfer_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
@@ -211,7 +211,6 @@ impl<D: Driver> PipeWrap<D> {
                 }
             }
         }
-
     }
 
     pub async fn control_transfer(
