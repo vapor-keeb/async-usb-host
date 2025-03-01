@@ -1,10 +1,6 @@
 #![no_std]
 use core::{
-    future::Future,
-    marker::PhantomData,
-    mem::transmute,
-    pin::{pin, Pin},
-    task::Poll,
+    array, future::Future, marker::PhantomData, mem::transmute, pin::{pin, Pin}, task::Poll
 };
 
 use arrayvec::ArrayVec;
@@ -20,7 +16,6 @@ use embassy_sync::{
 use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
-use rename_future::rename_future;
 use request::{Request, RequestType, StandardDeviceRequest};
 use types::{DataTog, EndpointAddress, InterruptChannel, Pid};
 
@@ -519,35 +514,12 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
     }
 
     async fn run_device_attached(&mut self, interrupt_xfer: ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>) -> HostState<'a, NR_PENDING_TRANSFERS> {
-        let futures: [_; NR_CLIENTS] = array::from_fn(|i| self.clients[i].client2host.receive());
-
         let bus_fut = self.bus.0.poll();
-        match select(client_request_fut, bus_fut).await {
-            Either::First((client_request, client_id)) => {
-                trace!("got request: {}, {:?}", client_id, client_request);
-                match client_request {
-                    Client2HostMessage::ClientReady => warn!("client ready"),
-                    Client2HostMessage::ControlTransfer {
-                        dev_handle,
-                        request,
-                        buffer,
-                    } => {
-                        let result = self
-                            .pipe
-                            .control_transfer(dev_handle, &request, buffer)
-                            .await;
-                        // self.clients[client_id]
-                        //     .host2client
-                        //     .send(Host2ClientMessage::ControlTransferResponse { result, buffer })
-                        //     .await;
-                    }
-                    Client2HostMessage::InterruptTransfer {
-                        dev_handle,
-                        endpoint_address,
-                        buffer,
-                    } => todo!(),
-                }
-                HostState::Suspended // TODO: garbage
+        let interrupt_xfer_fut = self.run_interrupt_transfer(&mut interrupt_xfer);
+        match select(interrupt_xfer_fut, bus_fut).await {
+            Either::First(xfer) => {
+                info!("Interrupt xfer completed");
+                HostState::DeviceAttached { interrupt_transfers: interrupt_xfer }
             }
             Either::Second(bus_event) => Self::handle_bus_event(&mut self.bus, bus_event).await,
         }
@@ -624,7 +596,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
         let msg = if let Some((descriptor, handle)) = opt {
             trace!("device attached!");
             if descriptor.device_class == UsbBaseClass::Hub.into() {
-                unwrap!(driver::hub::register_hub(self, handle, descriptor).await);
+                // unwrap!(driver::hub::register_hub(self, handle, descriptor).await);
                 None
             } else {
                 Some(Host2ClientMessage::NewDevice { descriptor, handle })
