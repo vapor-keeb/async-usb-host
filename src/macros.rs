@@ -1,5 +1,3 @@
-#![macro_use]
-
 #[collapse_debuginfo(yes)]
 macro_rules! panic {
     ($($x:tt)*) => {

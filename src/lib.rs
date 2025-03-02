@@ -1,9 +1,8 @@
 #![no_std]
-use core::{marker::PhantomData, task::Poll};
-
 use arrayvec::ArrayVec;
 use bus::BusWrap;
 use consts::UsbBaseClass;
+use core::{marker::PhantomData, task::Poll};
 use descriptor::DeviceDescriptor;
 use device_addr::DeviceAddressAllocator;
 use embassy_futures::select::{select, Either};
@@ -14,14 +13,16 @@ use pipe::USBHostPipe;
 use request::Request;
 use types::{EndpointAddress, InterruptChannel};
 
+#[macro_use]
+mod macros;
+
 pub mod consts;
 pub mod descriptor;
-// pub mod driver;
 mod device_addr;
+pub mod driver;
 pub mod errors;
 mod futures;
 mod hot_potato;
-mod macros;
 pub mod request;
 pub mod types;
 
@@ -230,7 +231,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
         if let Some((descriptor, handle)) = opt {
             trace!("device attached!");
             if descriptor.device_class == UsbBaseClass::Hub.into() {
-                // unwrap!(driver::hub::register_hub(self, handle, descriptor).await);
+                unwrap!(driver::hub::register_hub(self.pipe, handle, descriptor).await);
                 None
             } else {
                 Some(HostEvent::NewDevice { descriptor, handle })
