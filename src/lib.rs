@@ -10,7 +10,7 @@ use embassy_futures::select::{select, Either};
 use embassy_time::Duration;
 use errors::UsbHostError;
 use futures::poll_select;
-use pipe::PipeWrap;
+use pipe::USBHostPipe;
 use request::Request;
 use types::{EndpointAddress, InterruptChannel};
 
@@ -26,7 +26,7 @@ pub mod request;
 pub mod types;
 
 mod bus;
-mod pipe;
+pub mod pipe;
 pub use bus::{Bus, Event};
 pub use device_addr::DeviceHandle;
 pub use pipe::Pipe;
@@ -74,21 +74,17 @@ pub enum HostEvent {
 pub struct Host<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize> {
     phantom: PhantomData<D>,
     bus: BusWrap<D>,
-    pipe: PipeWrap<D>,
+    pipe: &'a USBHostPipe<D>,
     state: HostState<'a, NR_PENDING_TRANSFERS>,
-    address_alloc: DeviceAddressAllocator,
 }
 
 impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
     Host<'a, D, NR_CLIENTS, NR_PENDING_TRANSFERS>
 {
-    pub fn new(driver: D) -> Self {
-        let (bus, pipe) = driver.start();
-
+    pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<D>) -> Self {
         Host {
             bus: BusWrap::new(bus),
-            pipe: PipeWrap::new(pipe),
-            address_alloc: DeviceAddressAllocator::new(),
+            pipe: pipe,
             state: HostState::Disconnected,
             phantom: PhantomData,
         }
@@ -175,7 +171,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
     }
 
     async fn run_device_attached(
-        pipe: &mut PipeWrap<D>,
+        pipe: &USBHostPipe<D>,
         bus: &mut BusWrap<D>,
         interrupt_xfer: &mut ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>,
     ) -> Option<HostState<'a, NR_PENDING_TRANSFERS>> {
@@ -205,7 +201,7 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
     }
 
     async fn run_enumerate(&mut self) -> Option<HostEvent> {
-        let pipe_future = self.pipe.dev_attach(&mut self.address_alloc);
+        let pipe_future = self.pipe.dev_attach();
         let bus_future = self.bus.wait_until_detach();
 
         let (state, opt) = poll_select(pipe_future, bus_future, |either| match either {

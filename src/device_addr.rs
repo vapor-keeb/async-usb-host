@@ -3,7 +3,7 @@
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub struct DeviceHandle {
     address: u8,
-    max_packet_size: u8,
+    max_packet_size: u16,
 }
 
 impl DeviceHandle {
@@ -11,7 +11,7 @@ impl DeviceHandle {
         self.address
     }
 
-    pub fn max_packet_size(&self) -> u8 {
+    pub fn max_packet_size(&self) -> u16 {
         self.max_packet_size
     }
 }
@@ -35,7 +35,7 @@ impl DeviceAddressAllocator {
         self.0[nth_byte as usize] = rest | ((if used { 1 } else { 0 }) << bit_offset);
     }
 
-    pub fn alloc_device_address(&mut self, max_packet_size: u8) -> DeviceHandle {
+    pub fn alloc_device_address(&mut self, max_packet_size: u16) -> DeviceHandle {
         let address = {
             let mut address: Option<u8> = None;
 

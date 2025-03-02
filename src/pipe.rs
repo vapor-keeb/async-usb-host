@@ -5,7 +5,13 @@ use embassy_futures::select::{select, Either};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, pipe};
 use embassy_time::Timer;
 
-use crate::{descriptor::{parse_descriptor, DeviceDescriptor}, errors::UsbHostError, request::{self, Request, StandardDeviceRequest}, types::{self, DataTog, InterruptChannel}, DeviceAddressAllocator, DeviceHandle, Driver, InterruptTransfer, TRANSFER_TIMEOUT};
+use crate::{
+    descriptor::{parse_descriptor, DeviceDescriptor},
+    errors::UsbHostError,
+    request::{self, Request, StandardDeviceRequest},
+    types::{self, DataTog, InterruptChannel},
+    DeviceAddressAllocator, DeviceHandle, Driver, InterruptTransfer, TRANSFER_TIMEOUT,
+};
 
 // not Send anyways
 #[allow(async_fn_in_trait)]
@@ -28,17 +34,15 @@ pub trait Pipe {
     ) -> Result<(), UsbHostError>;
 }
 
-pub(crate) struct PipeWrap<D: Driver>(Mutex<CriticalSectionRawMutex, D::Pipe>);
+struct USBHostPipeInner<D: Driver> {
+    pipe: D::Pipe,
+    address_alloc: DeviceAddressAllocator,
+}
 
-impl<D: Driver> PipeWrap<D> {
-    pub fn new(pipe: D::Pipe) -> Self {
-        Self(Mutex::new(pipe))
-    }
-
-    async fn setup(&self, req: &Request) -> Result<(), UsbHostError> {
-        let mut pipe = self.0.lock().await;
+impl<D: Driver> USBHostPipeInner<D> {
+    async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let setup_fut = pipe.setup(unsafe { transmute(req) });
+        let setup_fut = self.pipe.setup(unsafe { transmute(req) });
         match select(timeout_fut, setup_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
@@ -46,15 +50,14 @@ impl<D: Driver> PipeWrap<D> {
     }
 
     async fn data_in(
-        &self,
+        &mut self,
         endpoint: u8,
         tog: DataTog,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError> {
-        let mut pipe = self.0.lock().await;
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         let mut data_in_with_retry = async || loop {
-            match pipe.data_in(endpoint, tog, buf).await {
+            match self.pipe.data_in(endpoint, tog, buf).await {
                 Ok(size) => return Ok(size),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -72,42 +75,71 @@ impl<D: Driver> PipeWrap<D> {
     }
 
     async fn data_out(
-        &self,
+        &mut self,
         endpoint: u8,
         tog: DataTog,
         buf: &[u8],
     ) -> Result<(), UsbHostError> {
-        let mut pipe = self.0.lock().await;
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         // TODO retry like data_in
-        let data_fut = pipe.data_out(endpoint, tog, buf);
+        let data_fut = self.pipe.data_out(endpoint, tog, buf);
         match select(timeout_fut, data_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
         }
     }
+}
 
-    pub async fn assign_device_address(&self, addr: u8) -> Result<(), UsbHostError> {
-        let request = Request {
-            request_type: {
-                use request::*;
-                let mut t = RequestType::default();
-                t.set_data_direction(RequestTypeDirection::HostToDevice);
-                t.set_recipient(RequestTypeRecipient::Device);
-                t
-            },
-            request: StandardDeviceRequest::SetAddress as u8,
-            value: addr as u16,
-            index: 0,
-            length: 0,
-        };
+pub struct USBHostPipe<D: Driver> {
+    inner: Mutex<CriticalSectionRawMutex, USBHostPipeInner<D>>,
+}
 
-        // Setup stage
-        self.setup(&request).await?;
-        // Status stage (no data)
-        self.data_in(0, DataTog::DATA1, &mut []).await?;
+impl<D: Driver> USBHostPipe<D> {
+    pub fn new(pipe: D::Pipe) -> Self {
+        Self {
+            inner: Mutex::new(USBHostPipeInner {
+                pipe: pipe,
+                address_alloc: DeviceAddressAllocator::new(),
+            }),
+        }
+    }
 
-        Ok(())
+    pub async fn assign_device_address(
+        &self,
+        max_packet_size: u16,
+    ) -> Result<DeviceHandle, UsbHostError> {
+        let mut inner = self.inner.lock().await;
+        let handle = inner.address_alloc.alloc_device_address(max_packet_size);
+
+        if let Err(e) = (async || {
+            let request = Request {
+                request_type: {
+                    use request::*;
+                    let mut t = RequestType::default();
+                    t.set_data_direction(RequestTypeDirection::HostToDevice);
+                    t.set_recipient(RequestTypeRecipient::Device);
+                    t
+                },
+                request: StandardDeviceRequest::SetAddress as u8,
+                value: handle.address() as u16,
+                index: 0,
+                length: 0,
+            };
+
+            // Setup stage
+            inner.setup(&request).await?;
+            // Status stage (no data)
+            inner.data_in(0, DataTog::DATA1, &mut []).await?;
+
+            Ok(())
+        })()
+        .await
+        {
+            inner.address_alloc.free_address(handle);
+            return Err(e);
+        }
+
+        Ok(handle)
     }
 
     pub async fn get_device_descriptor<'a>(
@@ -115,6 +147,7 @@ impl<D: Driver> PipeWrap<D> {
         buf: &'a mut [u8],
     ) -> Result<&'a DeviceDescriptor, UsbHostError> {
         debug_assert!(buf.len() >= 18);
+        let mut inner = self.inner.lock().await;
         // Setup Stage
         let request = Request {
             request_type: {
@@ -130,13 +163,13 @@ impl<D: Driver> PipeWrap<D> {
             index: 0,
             length: 64,
         };
-        self.setup(&request).await?;
+        inner.setup(&request).await?;
         trace!("setup finished");
 
         let mut tog = DataTog::DATA1;
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = self.data_in(0, tog, buf).await?;
+        let in_result = inner.data_in(0, tog, buf).await?;
         tog.next();
         bytes_read += in_result;
 
@@ -147,7 +180,7 @@ impl<D: Driver> PipeWrap<D> {
             // the borrow is no longer in effect. Therefore, the unsafe transmute
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
-            let in_result = self
+            let in_result = inner
                 .data_in(0, tog, unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
@@ -160,7 +193,7 @@ impl<D: Driver> PipeWrap<D> {
         }
 
         // Status stage
-        self.data_out(0, DataTog::DATA1, &[]).await?;
+        inner.data_out(0, DataTog::DATA1, &[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         let dev_desc = parse_descriptor(buf)
@@ -173,18 +206,20 @@ impl<D: Driver> PipeWrap<D> {
         interrupt_channel: &mut InterruptChannel,
         buffer: &mut [u8],
     ) -> Result<usize, UsbHostError> {
-        let mut pipe = self.0.lock().await;
+        let mut inner = self.inner.lock().await;
         let endpoint = interrupt_channel.endpoint_address.number;
         let tog = interrupt_channel.tog;
         let buf = buffer;
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
 
-        pipe.set_addr(interrupt_channel.device_handle.address());
+        inner
+            .pipe
+            .set_addr(interrupt_channel.device_handle.address());
         let mut interrupt_transfer_with_retry = async || {
             let res = match interrupt_channel.endpoint_address.direction {
-                types::EndpointDirection::In => pipe.data_in(endpoint, tog, buf).await,
+                types::EndpointDirection::In => inner.data_in(endpoint, tog, buf).await,
                 types::EndpointDirection::Out => {
-                    pipe.data_out(endpoint, tog, buf).await.map(|_| 0)
+                    inner.data_out(endpoint, tog, buf).await.map(|_| 0)
                 }
             }?;
             interrupt_channel.tog.next();
@@ -202,10 +237,7 @@ impl<D: Driver> PipeWrap<D> {
         interrupt_xfer: &mut ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>,
     ) {
         for t in interrupt_xfer {
-            match self
-                .try_interrupt_transfer(&mut t.channel, t.buffer)
-                .await
-            {
+            match self.try_interrupt_transfer(&mut t.channel, t.buffer).await {
                 Ok(_) => return, // TODO: Do something? maybe
                 Err(_) => {
                     // nothing to do try again LOL
@@ -221,15 +253,16 @@ impl<D: Driver> PipeWrap<D> {
         buffer: &mut [u8],
     ) -> Result<usize, UsbHostError> {
         use request::RequestTypeDirection;
+        let mut inner = self.inner.lock().await;
         let dir = request.request_type.data_direction();
         let mut bytes_received = 0usize;
 
         debug_assert!(buffer.len() >= request.length as usize);
 
-        self.0.lock().await.set_addr(device_handle.address());
+        inner.pipe.set_addr(device_handle.address());
 
         // Setup stage
-        self.setup(request).await?;
+        inner.setup(request).await?;
 
         // (Optional) data stage
         if request.length > 0 {
@@ -238,7 +271,7 @@ impl<D: Driver> PipeWrap<D> {
                 RequestTypeDirection::DeviceToHost => {
                     let mut tog = DataTog::DATA1;
                     loop {
-                        let len = self.data_in(0, tog, &mut buffer[bytes_received..]).await?;
+                        let len = inner.data_in(0, tog, &mut buffer[bytes_received..]).await?;
                         tog.next();
                         bytes_received += len;
                         if len < device_handle.max_packet_size() as usize {
@@ -252,32 +285,25 @@ impl<D: Driver> PipeWrap<D> {
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                self.data_in(0, DataTog::DATA1, &mut []).await?;
+                inner.data_in(0, DataTog::DATA1, &mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                self.data_out(0, DataTog::DATA1, &[]).await?;
+                inner.data_out(0, DataTog::DATA1, &[]).await?;
             }
         }
 
         Ok(bytes_received)
     }
 
-    pub async fn dev_attach(
-        &self,
-        address_alloc: &mut DeviceAddressAllocator,
-    ) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
+    pub async fn dev_attach(&self) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
         let mut buffer: [u8; 18] = [0u8; 18];
         let d = self.get_device_descriptor(&mut buffer).await?;
         let max_packet_size = d.max_packet_size;
-        let handle = address_alloc.alloc_device_address(max_packet_size);
         trace!("DeviceDescriptor: {}", d);
 
-        self.assign_device_address(handle.address()).await?;
+        let handle = self.assign_device_address(max_packet_size as u16).await?;
         trace!("Device addressed {}", handle.address());
 
-        Ok((
-            d.clone(),
-            handle,
-        ))
+        Ok((d.clone(), handle))
     }
 }
