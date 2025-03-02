@@ -231,8 +231,13 @@ impl<'a, D: Driver, const NR_CLIENTS: usize, const NR_PENDING_TRANSFERS: usize>
         if let Some((descriptor, handle)) = opt {
             trace!("device attached!");
             if descriptor.device_class == UsbBaseClass::Hub.into() {
-                unwrap!(driver::hub::register_hub(self.pipe, handle, descriptor).await);
-                None
+                driver::hub::Hub::new(self.pipe, handle, descriptor)
+                    .await
+                    .map(|_| None)
+                    .unwrap_or_else(|e| {
+                        debug!("{}", e);
+                        Some(HostEvent::Suspended)
+                    })
             } else {
                 Some(HostEvent::NewDevice { descriptor, handle })
             }

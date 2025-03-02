@@ -11,6 +11,7 @@ embassy-futures = { version = "0.1.0" }
 static_assertions = "1.1.0"
 embassy-sync = "0.6.2"
 arrayvec = { version = "0.7.6", default-features = false }
+bitvec = { version = "1.0.1", default-features = false }
 
 [features]
 defmt = ["dep:defmt"]
