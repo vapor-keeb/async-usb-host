@@ -3,37 +3,36 @@ use crate::{
         hub::HubDescriptor, parse_descriptor, ConfigurationDescriptor, Descriptor, DeviceDescriptor,
     },
     errors::UsbHostError,
+    pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
     types::DataTog,
     DeviceHandle, Driver, Host,
 };
 
-pub(crate) async fn register_hub<D: Driver, const NR_CLIENTS: usize>(
-    host: &mut Host<'_, D, NR_CLIENTS>,
+pub(crate) async fn register_hub<D: Driver>(
+    pipe: &USBHostPipe<D>,
     handle: DeviceHandle,
     descriptor: DeviceDescriptor,
 ) -> Result<(), UsbHostError> {
     // Pull Configuraiton Descriptor
     let mut buf: [u8; 255] = [0; 255];
     let len = unwrap!(
-        host.pipe
-            .control_transfer(
-                handle,
-                &Request::get_configuration_descriptor(
-                    0,
-                    core::mem::size_of::<ConfigurationDescriptor>() as u16
-                ),
-                &mut buf,
-            )
-            .await
+        pipe.control_transfer(
+            handle,
+            &Request::get_configuration_descriptor(
+                0,
+                core::mem::size_of::<ConfigurationDescriptor>() as u16
+            ),
+            &mut buf,
+        )
+        .await
     );
     let cfg = parse_descriptor(&buf[..len])
         .and_then(|desc| desc.configuration().ok_or(UsbHostError::InvalidResponse))?
         .clone();
     trace!("configuration recv {} bytes: {:?}", len, cfg);
     // set config
-    host.pipe
-        .control_transfer(handle, &Request::set_configuration(cfg.value), &mut [])
+    pipe.control_transfer(handle, &Request::set_configuration(cfg.value), &mut [])
         .await?;
 
     let mut hub_desc = HubDescriptor::default();
@@ -43,25 +42,24 @@ pub(crate) async fn register_hub<D: Driver, const NR_CLIENTS: usize>(
             core::mem::size_of::<HubDescriptor>(),
         )
     };
-    host.pipe
-        .control_transfer(
-            handle,
-            &Request::get_descriptor(
-                0x29, // Hub Descriptor
-                RequestTypeType::Class,
-                0,
-                0,
-                hub_desc_buf.len() as u16,
-            ),
-            hub_desc_buf,
-        )
-        .await?;
+    pipe.control_transfer(
+        handle,
+        &Request::get_descriptor(
+            0x29, // Hub Descriptor
+            RequestTypeType::Class,
+            0,
+            0,
+            hub_desc_buf.len() as u16,
+        ),
+        hub_desc_buf,
+    )
+    .await?;
 
     debug!("hub descriptor: {:?}", hub_desc);
 
     // enable ports
     for port in 1..=hub_desc.number_of_ports {
-        host.pipe
+        pipe
             .control_transfer(
                 handle,
                 &Request::set_feature(
@@ -78,7 +76,7 @@ pub(crate) async fn register_hub<D: Driver, const NR_CLIENTS: usize>(
 
     for port in 1..=hub_desc.number_of_ports {
         let mut port_status = [0u8; 4];
-        host.pipe
+        pipe
             .control_transfer(
                 handle,
                 &Request::get_status(
@@ -96,7 +94,7 @@ pub(crate) async fn register_hub<D: Driver, const NR_CLIENTS: usize>(
 
     // get configuration descriptor again with the proper len
     let len = unwrap!(
-        host.pipe
+        pipe
             .control_transfer(
                 handle,
                 &Request::get_configuration_descriptor(0, cfg.total_length),
@@ -117,10 +115,13 @@ pub(crate) async fn register_hub<D: Driver, const NR_CLIENTS: usize>(
                 // for each port
                 // GET_STATUS
                 // SET_FEATURE
+
+                // This is just an interrupt transfer
+                /*
                 loop {
                     let mut in_buf: [u8; 64] = [0; 64];
-                    let in_buf_len = host
-                        .pipe
+                    let in_buf_len =
+                        pipe
                         .data_in(
                             endpoint_descriptor.b_endpoint_address,
                             DataTog::DATA0,
@@ -131,7 +132,7 @@ pub(crate) async fn register_hub<D: Driver, const NR_CLIENTS: usize>(
                         trace!("{}", in_buf[..in_buf_len]);
                         break;
                     }
-                }
+                } */
 
                 endpoint_descriptor.b_length
             }
