@@ -49,7 +49,7 @@ impl<D: Driver> USBHostPipeInner<D> {
         }
     }
 
-    async fn data_in(
+    async fn data_in_with_retry(
         &mut self,
         endpoint: u8,
         tog: DataTog,
@@ -74,6 +74,20 @@ impl<D: Driver> USBHostPipeInner<D> {
         }
     }
 
+    async fn data_in(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
+        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        let data_fut = self.pipe.data_in(endpoint, tog, buf);
+        match select(timeout_fut, data_fut).await {
+            Either::First(_) => Err(UsbHostError::TransferTimeout),
+            Either::Second(r) => r,
+        }
+    }
+
     async fn data_out(
         &mut self,
         endpoint: u8,
@@ -81,7 +95,6 @@ impl<D: Driver> USBHostPipeInner<D> {
         buf: &[u8],
     ) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        // TODO retry like data_in
         let data_fut = self.pipe.data_out(endpoint, tog, buf);
         match select(timeout_fut, data_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
@@ -90,20 +103,17 @@ impl<D: Driver> USBHostPipeInner<D> {
     }
 }
 
-pub struct USBHostPipe<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> {
+pub struct USBHostPipe<D: Driver> {
     inner: Mutex<CriticalSectionRawMutex, USBHostPipeInner<D>>,
-    interrupt_transfers:
-        Mutex<CriticalSectionRawMutex, ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>>,
 }
 
-impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PENDING_TRANSFERS> {
+impl<D: Driver> USBHostPipe<D> {
     pub fn new(pipe: D::Pipe) -> Self {
         Self {
             inner: Mutex::new(USBHostPipeInner {
                 pipe,
                 address_alloc: DeviceAddressAllocator::new(),
             }),
-            interrupt_transfers: Mutex::new(ArrayVec::new()),
         }
     }
 
@@ -132,7 +142,7 @@ impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PEN
             // Setup stage
             inner.setup(&request).await?;
             // Status stage (no data)
-            inner.data_in(0, DataTog::DATA1, &mut []).await?;
+            inner.data_in_with_retry(0, DataTog::DATA1, &mut []).await?;
 
             Ok(())
         })()
@@ -174,7 +184,7 @@ impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PEN
         let mut tog = DataTog::DATA1;
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = inner.data_in(0, tog, buf).await?;
+        let in_result = inner.data_in_with_retry(0, tog, buf).await?;
         tog.next();
         bytes_read += in_result;
 
@@ -186,7 +196,7 @@ impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PEN
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
             let in_result = inner
-                .data_in(0, tog, unsafe {
+                .data_in_with_retry(0, tog, unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
                         chopped_off_buf.len(),
@@ -206,53 +216,26 @@ impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PEN
         Ok(dev_desc)
     }
 
-    pub async fn try_interrupt_transfer(
+    pub async fn interrupt_transfer(
         &self,
         interrupt_channel: &mut InterruptChannel,
-        buffer: &mut [u8],
+        buf: &mut [u8],
     ) -> Result<usize, UsbHostError> {
         let mut inner = self.inner.lock().await;
         let endpoint = interrupt_channel.endpoint_address.number;
         let tog = interrupt_channel.tog;
-        let buf = buffer;
-        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        let buf = buf;
 
         inner
             .pipe
             .set_addr(interrupt_channel.device_handle.address());
-        let mut interrupt_transfer_with_retry = async || {
-            let res = match interrupt_channel.endpoint_address.direction {
-                types::EndpointDirection::In => inner.data_in(endpoint, tog, buf).await,
-                types::EndpointDirection::Out => {
-                    inner.data_out(endpoint, tog, buf).await.map(|_| 0)
-                }
-            }?;
-            interrupt_channel.tog.next();
-            Ok(res)
-        };
-        let interrupt_transfer_fut = interrupt_transfer_with_retry();
-        match select(timeout_fut, interrupt_transfer_fut).await {
-            Either::First(_) => Err(UsbHostError::TransferTimeout),
-            Either::Second(r) => r,
-        }
-    }
 
-    pub async fn interrupt_transfer(&self) -> Option<(InterruptChannel, usize)> {
-        let mut interrupt_transfers = self.interrupt_transfers.lock().await;
-        let mut completed = None;
-        for (idx, t) in interrupt_transfers.iter_mut().enumerate() {
-            match self.try_interrupt_transfer(&mut t.channel, t.buffer).await {
-                Ok(len) => {
-                    completed = Some((idx, len));
-                    break;
-                }
-                Err(e) => {
-                    error!("{}", e);
-                    // nothing to do try again LOL
-                }
-            }
-        }
-        completed.map(|(idx, len)| (interrupt_transfers.remove(idx).channel, len))
+        let res = match interrupt_channel.endpoint_address.direction {
+            types::EndpointDirection::In => inner.data_in(endpoint, tog, buf).await,
+            types::EndpointDirection::Out => inner.data_out(endpoint, tog, buf).await.map(|_| 0),
+        }?;
+        interrupt_channel.tog.next();
+        Ok(res)
     }
 
     pub async fn control_transfer(
@@ -280,7 +263,9 @@ impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PEN
                 RequestTypeDirection::DeviceToHost => {
                     let mut tog = DataTog::DATA1;
                     loop {
-                        let len = inner.data_in(0, tog, &mut buffer[bytes_received..]).await?;
+                        let len = inner
+                            .data_in_with_retry(0, tog, &mut buffer[bytes_received..])
+                            .await?;
                         tog.next();
                         bytes_received += len;
                         if len < device_handle.max_packet_size() as usize {
@@ -294,7 +279,7 @@ impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PEN
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                inner.data_in(0, DataTog::DATA1, &mut []).await?;
+                inner.data_in_with_retry(0, DataTog::DATA1, &mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
                 inner.data_out(0, DataTog::DATA1, &[]).await?;

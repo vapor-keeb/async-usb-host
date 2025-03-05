@@ -1,4 +1,4 @@
-use crate::DeviceHandle;
+use crate::{descriptor::EndpointDescriptor, DeviceHandle};
 
 /// Represents a 16-bit binary-coded-decimal value
 ///
@@ -113,6 +113,21 @@ pub enum EndpointDirection {
 pub struct EndpointAddress {
     pub number: u8,
     pub direction: EndpointDirection,
+}
+
+impl From<&EndpointDescriptor> for EndpointAddress {
+    fn from(value: &EndpointDescriptor) -> Self {
+        let number = value.b_endpoint_address & 0xF;
+        let direction = if value.b_endpoint_address & 0x80 == 0 {
+            EndpointDirection::Out
+        } else {
+            EndpointDirection::In
+        };
+        EndpointAddress {
+            number,
+            direction,
+        }
+    }
 }
 
 #[derive(Clone)]

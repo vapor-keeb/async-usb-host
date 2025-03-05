@@ -7,7 +7,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::DataTog,
+    types::{DataTog, EndpointAddress, InterruptChannel},
     DeviceHandle, Driver, Host,
 };
 
@@ -15,11 +15,12 @@ pub(crate) struct Hub {
     handle: DeviceHandle,
     nr_ports: u8,
     ports: BitArr!(for 128),
+    interrupt_channel: InterruptChannel,
 }
 
 impl Hub {
-    pub async fn new<'a, D: Driver, const NR_PENDING_TRANSFERS: usize>(
-        pipe: &USBHostPipe<'a, D, NR_PENDING_TRANSFERS>,
+    pub async fn new<D: Driver>(
+        pipe: &USBHostPipe<D>,
         handle: DeviceHandle,
         descriptor: DeviceDescriptor,
     ) -> Result<Self, UsbHostError> {
@@ -110,6 +111,7 @@ impl Hub {
         );
         // TODO should probably iterate through the descriptor
         let mut cfg_buf = &buf[..len];
+        let mut endpoint_address = None;
         while !cfg_buf.is_empty() {
             let desc = parse_descriptor(cfg_buf)?;
             let len = match desc {
@@ -140,8 +142,10 @@ impl Hub {
                             trace!("{}", in_buf[..in_buf_len]);
                             break;
                         }
-                    } */
-
+                    } 
+                    */
+                    assert!(endpoint_address.is_none());
+                    endpoint_address = Some(endpoint_descriptor.into());
                     endpoint_descriptor.b_length
                 }
                 Descriptor::Interface(interface_descriptor) => interface_descriptor.b_length,
@@ -150,10 +154,34 @@ impl Hub {
             cfg_buf = &cfg_buf[len..];
         }
 
+        let endpoint_address = endpoint_address.ok_or(UsbHostError::InvalidResponse)?;
+
         Ok(Hub {
             handle,
             nr_ports: hub_desc.number_of_ports,
             ports: BitArray::ZERO,
+            interrupt_channel: InterruptChannel {
+                device_handle: handle,
+                endpoint_address,
+                tog: DataTog::DATA0,
+            },
         })
+    }
+
+    pub async fn poll<D: Driver>(&mut self, pipe: &USBHostPipe<D>) {
+        // interrupt transfer with pipe
+        let mut in_buf: [u8; 64] = [0; 64];
+        let in_buf_len = pipe.interrupt_transfer(&mut self.interrupt_channel, &mut in_buf).await;
+        match in_buf_len {
+            Ok(in_buf_len) => {
+                trace!("{}", in_buf[..in_buf_len]);
+            }
+            Err(UsbHostError::NAK) => {
+                return
+            }
+            Err(e) => {
+                error!("interrupt transfer error: {:?}", e);
+            }
+        }
     }
 }

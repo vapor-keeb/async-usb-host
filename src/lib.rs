@@ -2,10 +2,10 @@
 use arrayvec::ArrayVec;
 use bus::BusWrap;
 use consts::UsbBaseClass;
-use driver::hub::Hub;
 use core::{error, marker::PhantomData, task::Poll};
 use descriptor::DeviceDescriptor;
 use device_addr::DeviceAddressAllocator;
+use driver::hub::Hub;
 use embassy_futures::select::{select, Either};
 use embassy_time::Duration;
 use errors::UsbHostError;
@@ -75,55 +75,19 @@ pub enum HostEvent {
 pub struct Host<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize> {
     phantom: PhantomData<D>,
     bus: BusWrap<D>,
-    pipe: &'a USBHostPipe<'a, D, NR_PENDING_TRANSFERS>,
+    pipe: &'a USBHostPipe<D>,
     state: HostState<NR_HUBS>,
 }
 
 impl<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize>
     Host<'a, D, NR_HUBS, NR_PENDING_TRANSFERS>
 {
-    pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<'a, D, NR_PENDING_TRANSFERS>) -> Self {
+    pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<D>) -> Self {
         Host {
             bus: BusWrap::new(bus),
             pipe,
             state: HostState::Disconnected,
             phantom: PhantomData,
-        }
-    }
-
-    pub async fn control_transfer(
-        &mut self,
-        dev_handle: DeviceHandle,
-        request: Request,
-        buffer: &'a mut [u8],
-    ) -> Result<usize, UsbHostError> {
-        if let HostState::DeviceAttached { .. } = self.state {
-            self.pipe
-                .control_transfer(dev_handle, &request, buffer)
-                .await
-        } else {
-            return Err(UsbHostError::InvalidState);
-        }
-    }
-
-    pub async fn interrupt_transfer(
-        &mut self,
-        interrupt_channel: InterruptChannel,
-        buffer: &'a mut [u8],
-    ) -> Result<(), UsbHostError> {
-        if let HostState::DeviceAttached {
-            ref mut interrupt_transfers,
-            ..
-        } = self.state
-        {
-            interrupt_transfers
-                .try_push(InterruptTransfer {
-                    channel: interrupt_channel,
-                    buffer,
-                })
-                .map_err(|cap| UsbHostError::InterruptTransferCapacity(cap.element().channel))
-        } else {
-            return Err(UsbHostError::InvalidState);
         }
     }
 
@@ -144,17 +108,12 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize>
                     }
                 }
                 Host {
-                    state:
-                        HostState::DeviceAttached {
-                            hubs,
-                        },
+                    state: HostState::DeviceAttached { hubs },
                     pipe,
                     bus,
                     ..
                 } => {
-                    if let Some(new_state) =
-                        Self::run_device_attached(pipe, bus, hubs).await
-                    {
+                    if let Some(new_state) = Self::run_device_attached(pipe, bus, hubs).await {
                         self.state = new_state;
                     }
                 }
@@ -170,13 +129,18 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize>
     }
 
     async fn run_device_attached(
-        pipe: &USBHostPipe<'a, D, NR_PENDING_TRANSFERS>,
+        pipe: &USBHostPipe<D>,
         bus: &mut BusWrap<D>,
         hubs: &mut ArrayVec<Hub, NR_HUBS>,
     ) -> Option<HostState<NR_HUBS>> {
         let bus_fut = Self::handle_bus_event(bus);
-        let interrupt_xfer_fut = pipe.interrupt_transfer();
-        match select(interrupt_xfer_fut, bus_fut).await {
+        let mut hubs_fut = async || {
+            for hub in hubs.iter_mut() {
+                hub.poll(pipe).await;
+            }
+        };
+        let hubs_fut = hubs_fut();
+        match select(hubs_fut, bus_fut).await {
             Either::First(xfer) => None,
             Either::Second(state) => Some(state),
         }
@@ -187,9 +151,7 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize>
         self.state = Self::handle_bus_event(&mut self.bus).await;
     }
 
-    async fn handle_bus_event(
-        bus: &mut BusWrap<D>,
-    ) -> HostState<NR_HUBS> {
+    async fn handle_bus_event(bus: &mut BusWrap<D>) -> HostState<NR_HUBS> {
         let event = bus.poll().await;
         info!("event: {}", event);
         match event {
@@ -207,7 +169,7 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize>
             Ok(event) => {
                 self.state = HostState::DeviceAttached { hubs };
                 event.map(|(descriptor, handle)| HostEvent::NewDevice { descriptor, handle })
-            },
+            }
             Err(e) => {
                 error!("{}", e);
                 self.state = HostState::Disconnected;
@@ -219,20 +181,19 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_PENDING_TRANSFERS: usize>
     /// Ok(None) if the device is a hub
     /// Ok(Some((descriptor, handle))) if the device is not a hub
     /// Err if there is an error
-    async fn enumerate_device(&mut self, hubs: &mut ArrayVec<Hub, NR_HUBS>) -> Result<Option<(DeviceDescriptor, DeviceHandle)>, UsbHostError> {
+    async fn enumerate_device(
+        &mut self,
+        hubs: &mut ArrayVec<Hub, NR_HUBS>,
+    ) -> Result<Option<(DeviceDescriptor, DeviceHandle)>, UsbHostError> {
         let pipe_future = self.pipe.dev_attach();
         let bus_future = self.bus.wait_until_detach();
 
         let (descriptor, handle) = poll_select(pipe_future, bus_future, |either| match either {
             futures::Either::First(device_result) => match device_result {
                 Ok((descriptor, handle)) => Poll::Ready(Ok((descriptor, handle))),
-                Err(e) => {
-                    Poll::Ready(Err(e))
-                }
+                Err(e) => Poll::Ready(Err(e)),
             },
-            futures::Either::Second(_) => {
-                Poll::Ready(Err(UsbHostError::Detached))
-            }
+            futures::Either::Second(_) => Poll::Ready(Err(UsbHostError::Detached)),
         })
         .await?;
 
