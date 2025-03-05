@@ -90,17 +90,20 @@ impl<D: Driver> USBHostPipeInner<D> {
     }
 }
 
-pub struct USBHostPipe<D: Driver> {
+pub struct USBHostPipe<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> {
     inner: Mutex<CriticalSectionRawMutex, USBHostPipeInner<D>>,
+    interrupt_transfers:
+        Mutex<CriticalSectionRawMutex, ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>>,
 }
 
-impl<D: Driver> USBHostPipe<D> {
+impl<'a, D: Driver, const NR_PENDING_TRANSFERS: usize> USBHostPipe<'a, D, NR_PENDING_TRANSFERS> {
     pub fn new(pipe: D::Pipe) -> Self {
         Self {
             inner: Mutex::new(USBHostPipeInner {
-                pipe: pipe,
+                pipe,
                 address_alloc: DeviceAddressAllocator::new(),
             }),
+            interrupt_transfers: Mutex::new(ArrayVec::new()),
         }
     }
 
@@ -142,10 +145,10 @@ impl<D: Driver> USBHostPipe<D> {
         Ok(handle)
     }
 
-    pub async fn get_device_descriptor<'a>(
+    async fn get_device_descriptor<'b>(
         &self,
-        buf: &'a mut [u8],
-    ) -> Result<&'a DeviceDescriptor, UsbHostError> {
+        buf: &'b mut [u8],
+    ) -> Result<&'b DeviceDescriptor, UsbHostError> {
         debug_assert!(buf.len() >= 18);
         let mut inner = self.inner.lock().await;
         // Setup Stage
@@ -163,6 +166,8 @@ impl<D: Driver> USBHostPipe<D> {
             index: 0,
             length: 64,
         };
+        // default address upon initial connection
+        inner.pipe.set_addr(0);
         inner.setup(&request).await?;
         trace!("setup finished");
 
@@ -232,18 +237,22 @@ impl<D: Driver> USBHostPipe<D> {
         }
     }
 
-    pub async fn interrupt_transfer<'a, const NR_PENDING_TRANSFERS: usize>(
-        &self,
-        interrupt_xfer: &mut ArrayVec<InterruptTransfer<'a>, NR_PENDING_TRANSFERS>,
-    ) {
-        for t in interrupt_xfer {
+    pub async fn interrupt_transfer(&self) -> Option<(InterruptChannel, usize)> {
+        let mut interrupt_transfers = self.interrupt_transfers.lock().await;
+        let mut completed = None;
+        for (idx, t) in interrupt_transfers.iter_mut().enumerate() {
             match self.try_interrupt_transfer(&mut t.channel, t.buffer).await {
-                Ok(_) => return, // TODO: Do something? maybe
-                Err(_) => {
+                Ok(len) => {
+                    completed = Some((idx, len));
+                    break;
+                }
+                Err(e) => {
+                    error!("{}", e);
                     // nothing to do try again LOL
                 }
             }
         }
+        completed.map(|(idx, len)| (interrupt_transfers.remove(idx).channel, len))
     }
 
     pub async fn control_transfer(

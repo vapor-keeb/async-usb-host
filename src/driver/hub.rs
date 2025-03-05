@@ -18,8 +18,8 @@ pub(crate) struct Hub {
 }
 
 impl Hub {
-    pub async fn new<D: Driver>(
-        pipe: &USBHostPipe<D>,
+    pub async fn new<'a, D: Driver, const NR_PENDING_TRANSFERS: usize>(
+        pipe: &USBHostPipe<'a, D, NR_PENDING_TRANSFERS>,
         handle: DeviceHandle,
         descriptor: DeviceDescriptor,
     ) -> Result<Self, UsbHostError> {

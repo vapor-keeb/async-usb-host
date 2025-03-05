@@ -14,4 +14,5 @@ pub enum UsbHostError {
     InvalidResponse,
     InterruptTransferCapacity(InterruptChannel),
     HubCapacity,
+    Detached,
 }
