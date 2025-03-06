@@ -12,6 +12,8 @@ use crate::{
     DeviceHandle, Driver, Host,
 };
 
+type PortChangeBitmask = BitArr!(for 128, in u8);
+
 pub(crate) struct Hub {
     handle: DeviceHandle,
     nr_ports: u8,
@@ -239,14 +241,17 @@ impl Hub {
         }
     }
 
-    async fn on_status_change(&mut self, pipe: &USBHostPipe<impl Driver>, bitmask: &[u8]) {
+    async fn on_status_change(&mut self, pipe: &USBHostPipe<impl Driver>, bitmask: &PortChangeBitmask) {
         // TODO: left off here
         // Poll port status
-        for port in 1..=self.nr_ports {
-            if let Ok((status, change)) = self.get_port_status(pipe, port).await {
+        for port in bitmask.iter_ones() {
+            if port == 0 {
+                continue; // 0 is hub
+            }
+            if let Ok((status, change)) = self.get_port_status(pipe, port as u8).await {
                 debug!("port {} status: {:?}\n change: {:?}", port, status, change);
                 if change.connection() {
-                    unwrap!(self.clear_port_feature(pipe, port, HubPortFeature::ChangeConnection)
+                    unwrap!(self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeConnection)
                         .await);
                 }
             }
@@ -256,14 +261,14 @@ impl Hub {
     // Main deal
     pub async fn poll<D: Driver>(&mut self, pipe: &USBHostPipe<D>) {
         // interrupt transfer with pipe
-        let mut in_buf: [u8; 64] = [0; 64];
+        let mut in_buf: PortChangeBitmask = BitArray::ZERO;
         let in_buf_len = pipe
-            .interrupt_transfer(&mut self.interrupt_channel, &mut in_buf)
+            .interrupt_transfer(&mut self.interrupt_channel, in_buf.as_raw_mut_slice())
             .await;
         match in_buf_len {
-            Ok(in_buf_len) => {
-                trace!("{}", in_buf[..in_buf_len]);
-                self.on_status_change(pipe, &in_buf[..in_buf_len]).await;
+            Ok(len) => {
+                assert!(len > 0);
+                self.on_status_change(pipe, &in_buf).await;
             }
             Err(UsbHostError::NAK) => return,
             Err(e) => {
