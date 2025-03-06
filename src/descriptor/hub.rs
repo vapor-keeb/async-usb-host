@@ -77,6 +77,12 @@ impl HubPortStatus {
     }
 }
 
+impl From<u16> for HubPortStatus {
+    fn from(val: u16) -> Self {
+        HubPortStatus(val)
+    }
+}
+
 #[cfg(feature = "defmt")]
 impl defmt::Format for HubPortStatus {
     fn format(&self, f: defmt::Formatter) {
@@ -97,9 +103,49 @@ impl defmt::Format for HubPortStatus {
     }
 }
 
-impl From<u16> for HubPortStatus {
+#[derive(Clone, Copy)]
+pub struct HubPortStatusChange(u16);
+
+impl HubPortStatusChange {
+    pub fn connection(&self) -> bool {
+        self.0 & 0x1 != 0
+    }
+
+    pub fn enable(&self) -> bool {
+        self.0 & 0x2 != 0
+    }
+
+    pub fn suspend(&self) -> bool {
+        self.0 & 0x4 != 0
+    }
+
+    pub fn over_current(&self) -> bool {
+        self.0 & 0x8 != 0
+    }
+
+    pub fn reset(&self) -> bool {
+        self.0 & 0x10 != 0
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for HubPortStatusChange {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(
+            f,
+            "HubPortStatusChange {{ connection: {}, enable: {}, suspend: {}, over_current: {}, reset: {} }}",
+            self.connection(),
+            self.enable(),
+            self.suspend(),
+            self.over_current(),
+            self.reset()
+        )
+    }
+}
+
+impl From<u16> for HubPortStatusChange {
     fn from(val: u16) -> Self {
-        HubPortStatus(val)
+        HubPortStatusChange(val)
     }
 }
 
@@ -115,6 +161,11 @@ pub enum HubPortFeature {
     Reset = 4,
     Power = 8,
     LowSpeed = 9,
+    ChangeConnection = 16,
+    ChangeEnable = 17,
+    ChangeSuspend = 18,
+    ChangeOverCurrent = 19,
+    ChangeReset = 20,
     Test = 21,
     Indicator = 22,
 }

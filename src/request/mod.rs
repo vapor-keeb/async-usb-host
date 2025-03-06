@@ -88,6 +88,22 @@ impl Request {
         }
     }
 
+    pub fn clear_feature(recepient: RequestTypeRecipient, request_type_type: RequestTypeType, feature: u16, index: u16, length: u16) -> Request {
+        Request {
+            request_type: {
+                let mut t = RequestType::default();
+                t.set_data_direction(RequestTypeDirection::HostToDevice);
+                t.set_type(request_type_type);
+                t.set_recipient(recepient);
+                t
+            },
+            request: StandardDeviceRequest::ClearFeature as u8,
+            value: feature,
+            index: index,
+            length: length,
+        }
+    }
+
     pub fn get_configuration_descriptor(index: u8, length: u16) -> Request {
         Self::get_descriptor(
             DescriptorType::Configuration as u8,

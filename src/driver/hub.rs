@@ -2,7 +2,7 @@ use bitvec::{array::BitArray, bitarr, order::Msb0, BitArr};
 
 use crate::{
     descriptor::{
-        hub::{HubDescriptor, HubPortFeature, HubPortStatus},
+        hub::{HubDescriptor, HubPortFeature, HubPortStatus, HubPortStatusChange},
         parse_descriptor, ConfigurationDescriptor, Descriptor, DeviceDescriptor,
     },
     errors::UsbHostError,
@@ -148,7 +148,7 @@ impl Hub {
         // Port number are 1 based
         // Poll port status
         for port in 1..=hub_desc.number_of_ports {
-            if let Ok(status) = hub.get_port_status(pipe, port).await {
+            if let Ok((status, _)) = hub.get_port_status(pipe, port).await {
                 debug!("port {} status: {:?}", port, status);
 
                 // Power it on if it is not already
@@ -164,6 +164,27 @@ impl Hub {
         }
 
         Ok(hub)
+    }
+
+    async fn clear_port_feature<D: Driver>(
+        &mut self,
+        pipe: &USBHostPipe<D>,
+        port: u8,
+        feature: HubPortFeature,
+    ) -> Result<(), UsbHostError> {
+        pipe.control_transfer(
+            self.handle,
+            &Request::clear_feature(
+                RequestTypeRecipient::Other,
+                RequestTypeType::Class,
+                feature as u16,
+                port as u16,
+                0,
+            ),
+            &mut [],
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn set_port_feature<D: Driver>(
@@ -191,7 +212,7 @@ impl Hub {
         &mut self,
         pipe: &USBHostPipe<D>,
         port: u8,
-    ) -> Result<HubPortStatus, UsbHostError> {
+    ) -> Result<(HubPortStatus, HubPortStatusChange), UsbHostError> {
         // TODO: handle status change bits
         let mut status_buf = [0u8; 4];
         match pipe
@@ -209,9 +230,9 @@ impl Hub {
             .await
         {
             Ok(len) => {
-                assert_eq!(len, 2);
-
-                Ok(u16::from_le_bytes([status_buf[0], status_buf[1]]).into())
+                assert_eq!(len, 4);
+                Ok((u16::from_le_bytes([status_buf[0], status_buf[1]]).into(),
+                    u16::from_le_bytes([status_buf[2], status_buf[3]]).into()))
             }
             Err(UsbHostError::BufferOverflow) => panic!("buffer overflow"),
             Err(e) => Err(e),
@@ -222,8 +243,12 @@ impl Hub {
         // TODO: left off here
         // Poll port status
         for port in 1..=self.nr_ports {
-            if let Ok(status) = self.get_port_status(pipe, port).await {
-                debug!("port {} status: {:?}", port, status);
+            if let Ok((status, change)) = self.get_port_status(pipe, port).await {
+                debug!("port {} status: {:?}\n change: {:?}", port, status, change);
+                if change.connection() {
+                    unwrap!(self.clear_port_feature(pipe, port, HubPortFeature::ChangeConnection)
+                        .await);
+                }
             }
         }
     }
