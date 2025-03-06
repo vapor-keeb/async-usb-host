@@ -42,6 +42,8 @@ struct USBHostPipeInner<D: Driver> {
 impl<D: Driver> USBHostPipeInner<D> {
     async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        #[cfg(not(target_endian = "little"))]
+        compile_error!("Only little endian supported");
         let setup_fut = self.pipe.setup(unsafe { transmute(req) });
         match select(timeout_fut, setup_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),

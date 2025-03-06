@@ -1,8 +1,9 @@
-use bitvec::{array::BitArray, order::Msb0, BitArr};
+use bitvec::{array::BitArray, bitarr, order::Msb0, BitArr};
 
 use crate::{
     descriptor::{
-        hub::HubDescriptor, parse_descriptor, ConfigurationDescriptor, Descriptor, DeviceDescriptor,
+        hub::{HubDescriptor, HubPortFeature, HubPortStatus},
+        parse_descriptor, ConfigurationDescriptor, Descriptor, DeviceDescriptor,
     },
     errors::UsbHostError,
     pipe::USBHostPipe,
@@ -14,7 +15,7 @@ use crate::{
 pub(crate) struct Hub {
     handle: DeviceHandle,
     nr_ports: u8,
-    ports: BitArr!(for 128),
+    ports_connected: BitArr!(for 128),
     interrupt_channel: InterruptChannel,
 }
 
@@ -109,6 +110,7 @@ impl Hub {
             )
             .await
         );
+
         // TODO should probably iterate through the descriptor
         let mut cfg_buf = &buf[..len];
         let mut endpoint_address = None;
@@ -120,30 +122,6 @@ impl Hub {
                     configuration_descriptor.length
                 }
                 Descriptor::Endpoint(endpoint_descriptor) => {
-                    // interview quality code
-                    // TODO needs to go into a separate polling task
-                    // for each port
-                    // GET_STATUS
-                    // SET_FEATURE
-
-                    // This is just an interrupt transfer
-                    /*
-                    loop {
-                        let mut in_buf: [u8; 64] = [0; 64];
-                        let in_buf_len =
-                            pipe
-                            .data_in(
-                                endpoint_descriptor.b_endpoint_address,
-                                DataTog::DATA0,
-                                &mut in_buf,
-                            )
-                            .await;
-                        if let Ok(in_buf_len) = in_buf_len {
-                            trace!("{}", in_buf[..in_buf_len]);
-                            break;
-                        }
-                    } 
-                    */
                     assert!(endpoint_address.is_none());
                     endpoint_address = Some(endpoint_descriptor.into());
                     endpoint_descriptor.b_length
@@ -156,29 +134,113 @@ impl Hub {
 
         let endpoint_address = endpoint_address.ok_or(UsbHostError::InvalidResponse)?;
 
-        Ok(Hub {
+        let mut hub = Hub {
             handle,
             nr_ports: hub_desc.number_of_ports,
-            ports: BitArray::ZERO,
+            ports_connected: BitArray::ZERO,
             interrupt_channel: InterruptChannel {
                 device_handle: handle,
                 endpoint_address,
                 tog: DataTog::DATA0,
             },
-        })
+        };
+
+        // Port number are 1 based
+        // Poll port status
+        for port in 1..=hub_desc.number_of_ports {
+            if let Ok(status) = hub.get_port_status(pipe, port).await {
+                debug!("port {} status: {:?}", port, status);
+
+                // Power it on if it is not already
+                if !status.power() {
+                    if let Err(e) = hub
+                        .set_port_feature(pipe, port, HubPortFeature::Power)
+                        .await
+                    {
+                        error!("failed to enable port {}: {:?}", port, e);
+                    }
+                }
+            }
+        }
+
+        Ok(hub)
     }
 
+    async fn set_port_feature<D: Driver>(
+        &mut self,
+        pipe: &USBHostPipe<D>,
+        port: u8,
+        feature: HubPortFeature,
+    ) -> Result<(), UsbHostError> {
+        pipe.control_transfer(
+            self.handle,
+            &Request::set_feature(
+                RequestTypeRecipient::Other,
+                RequestTypeType::Class,
+                feature as u16,
+                port as u16,
+                0,
+            ),
+            &mut [],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn get_port_status<D: Driver>(
+        &mut self,
+        pipe: &USBHostPipe<D>,
+        port: u8,
+    ) -> Result<HubPortStatus, UsbHostError> {
+        // TODO: handle status change bits
+        let mut status_buf = [0u8; 4];
+        match pipe
+            .control_transfer(
+                self.handle,
+                &Request::get_status(
+                    RequestTypeRecipient::Other,
+                    RequestTypeType::Class,
+                    0,
+                    port as u16,
+                    status_buf.len() as u16,
+                ),
+                &mut status_buf,
+            )
+            .await
+        {
+            Ok(len) => {
+                assert_eq!(len, 2);
+
+                Ok(u16::from_le_bytes([status_buf[0], status_buf[1]]).into())
+            }
+            Err(UsbHostError::BufferOverflow) => panic!("buffer overflow"),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn on_status_change(&mut self, pipe: &USBHostPipe<impl Driver>, bitmask: &[u8]) {
+        // TODO: left off here
+        // Poll port status
+        for port in 1..=self.nr_ports {
+            if let Ok(status) = self.get_port_status(pipe, port).await {
+                debug!("port {} status: {:?}", port, status);
+            }
+        }
+    }
+
+    // Main deal
     pub async fn poll<D: Driver>(&mut self, pipe: &USBHostPipe<D>) {
         // interrupt transfer with pipe
         let mut in_buf: [u8; 64] = [0; 64];
-        let in_buf_len = pipe.interrupt_transfer(&mut self.interrupt_channel, &mut in_buf).await;
+        let in_buf_len = pipe
+            .interrupt_transfer(&mut self.interrupt_channel, &mut in_buf)
+            .await;
         match in_buf_len {
             Ok(in_buf_len) => {
                 trace!("{}", in_buf[..in_buf_len]);
+                self.on_status_change(pipe, &in_buf[..in_buf_len]).await;
             }
-            Err(UsbHostError::NAK) => {
-                return
-            }
+            Err(UsbHostError::NAK) => return,
             Err(e) => {
                 error!("interrupt transfer error: {:?}", e);
             }
