@@ -21,6 +21,15 @@ pub(crate) struct Hub {
     interrupt_channel: InterruptChannel,
 }
 
+pub(crate) enum HubEvent {
+    DeviceAttach {
+        port: u8
+    },
+    DeviceDetach {
+        port: u8
+    },
+}
+
 impl Hub {
     pub async fn new<D: Driver>(
         pipe: &USBHostPipe<D>,
@@ -241,7 +250,7 @@ impl Hub {
         }
     }
 
-    async fn on_status_change(&mut self, pipe: &USBHostPipe<impl Driver>, bitmask: &PortChangeBitmask) {
+    async fn on_status_change(&mut self, pipe: &USBHostPipe<impl Driver>, bitmask: &PortChangeBitmask) -> Result<Option<HubEvent>, UsbHostError> {
         // TODO: left off here
         // Poll port status
         for port in bitmask.iter_ones() {
@@ -253,13 +262,26 @@ impl Hub {
                 if change.connection() {
                     unwrap!(self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeConnection)
                         .await);
+                    if status.connected() {
+                        unwrap!(self.set_port_feature(pipe, port as u8, HubPortFeature::Reset).await);
+                    }
+                }
+                if change.reset() {
+                    unwrap!(self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeReset)
+                        .await);
+                    if !status.reset() {
+                        return Ok(Some(HubEvent::DeviceAttach { port: port as u8 }));
+                    } else {
+                        error!("port {} reset changed but set to true", port);
+                    }
                 }
             }
         }
+        Ok(None)
     }
 
     // Main deal
-    pub async fn poll<D: Driver>(&mut self, pipe: &USBHostPipe<D>) {
+    pub async fn poll<D: Driver>(&mut self, pipe: &USBHostPipe<D>) -> Result<Option<HubEvent>, UsbHostError> {
         // interrupt transfer with pipe
         let mut in_buf: PortChangeBitmask = BitArray::ZERO;
         let in_buf_len = pipe
@@ -268,11 +290,12 @@ impl Hub {
         match in_buf_len {
             Ok(len) => {
                 assert!(len > 0);
-                self.on_status_change(pipe, &in_buf).await;
+                self.on_status_change(pipe, &in_buf).await
             }
-            Err(UsbHostError::NAK) => return,
+            Err(UsbHostError::NAK) => Ok(None),
             Err(e) => {
                 error!("interrupt transfer error: {:?}", e);
+                Err(e)
             }
         }
     }
