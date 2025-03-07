@@ -1,3 +1,5 @@
+use crate::types::AddressOption;
+
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
@@ -9,6 +11,10 @@ pub struct DeviceHandle {
 impl DeviceHandle {
     pub fn address(&self) -> u8 {
         self.address
+    }
+
+    pub fn addr_opt(&self) -> AddressOption {
+        AddressOption::new(self.address)
     }
 
     pub fn max_packet_size(&self) -> u16 {

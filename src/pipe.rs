@@ -10,7 +10,7 @@ use crate::{
     errors::UsbHostError,
     request::{self, Request, StandardDeviceRequest},
     types::{self, DataTog, InterruptChannel},
-    DeviceAddressAllocator, DeviceHandle, Driver, InterruptTransfer, TRANSFER_TIMEOUT,
+    DeviceAddressAllocator, DeviceHandle, Driver, TRANSFER_TIMEOUT,
 };
 
 // not Send anyways

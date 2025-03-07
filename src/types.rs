@@ -155,3 +155,29 @@ impl DataTog {
         };
     }
 }
+
+
+#[derive(Copy, Clone)]
+pub struct AddressOption(u8);
+
+impl AddressOption {
+    pub fn empty() -> Self {
+        AddressOption(0)
+    }
+
+    pub fn new(addr: u8) -> Self {
+        AddressOption(addr | 0x80u8)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0 & 0x80 == 0
+    }
+
+    pub fn addr(&self) -> Option<u8> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.0 & 0x7F)
+        }
+    }
+}

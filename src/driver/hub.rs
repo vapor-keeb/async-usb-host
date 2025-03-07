@@ -8,7 +8,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::{DataTog, EndpointAddress, InterruptChannel},
+    types::{AddressOption, DataTog, EndpointAddress, InterruptChannel},
     DeviceHandle, Driver, Host,
 };
 
@@ -16,25 +16,24 @@ type PortChangeBitmask = BitArr!(for 128, in u8);
 
 pub(crate) struct Hub {
     handle: DeviceHandle,
+    parent_addr: AddressOption,
     nr_ports: u8,
     ports_connected: BitArr!(for 128),
     interrupt_channel: InterruptChannel,
 }
 
 pub(crate) enum HubEvent {
-    DeviceAttach {
-        port: u8
-    },
-    DeviceDetach {
-        port: u8
-    },
+    DeviceReset,
+    DeviceAttach { port: u8, hub_addr: AddressOption },
+    DeviceDetach { port: u8 },
 }
 
 impl Hub {
     pub async fn new<D: Driver>(
         pipe: &USBHostPipe<D>,
         handle: DeviceHandle,
-        descriptor: DeviceDescriptor,
+        _descriptor: DeviceDescriptor, // TODO: maybe check if this is a hub?
+        parent: AddressOption,
     ) -> Result<Self, UsbHostError> {
         // Pull Configuraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
@@ -109,7 +108,6 @@ impl Hub {
                 &mut port_status,
             )
             .await?;
-            debug!("port status {}: {:?}", port, port_status);
         }
 
         // get configuration descriptor again with the proper len
@@ -147,6 +145,7 @@ impl Hub {
 
         let mut hub = Hub {
             handle,
+            parent_addr: parent,
             nr_ports: hub_desc.number_of_ports,
             ports_connected: BitArray::ZERO,
             interrupt_channel: InterruptChannel {
@@ -160,7 +159,7 @@ impl Hub {
         // Poll port status
         for port in 1..=hub_desc.number_of_ports {
             if let Ok((status, _)) = hub.get_port_status(pipe, port).await {
-                debug!("port {} status: {:?}", port, status);
+                trace!("port {} status: {:?}", port, status);
 
                 // Power it on if it is not already
                 if !status.power() {
@@ -242,15 +241,22 @@ impl Hub {
         {
             Ok(len) => {
                 assert_eq!(len, 4);
-                Ok((u16::from_le_bytes([status_buf[0], status_buf[1]]).into(),
-                    u16::from_le_bytes([status_buf[2], status_buf[3]]).into()))
+                Ok((
+                    u16::from_le_bytes([status_buf[0], status_buf[1]]).into(),
+                    u16::from_le_bytes([status_buf[2], status_buf[3]]).into(),
+                ))
             }
             Err(UsbHostError::BufferOverflow) => panic!("buffer overflow"),
             Err(e) => Err(e),
         }
     }
 
-    async fn on_status_change(&mut self, pipe: &USBHostPipe<impl Driver>, bitmask: &PortChangeBitmask) -> Result<Option<HubEvent>, UsbHostError> {
+    async fn on_status_change(
+        &mut self,
+        pipe: &USBHostPipe<impl Driver>,
+        bitmask: &PortChangeBitmask,
+        enumeration_in_progress: bool,
+    ) -> Result<Option<HubEvent>, UsbHostError> {
         // TODO: left off here
         // Poll port status
         for port in bitmask.iter_ones() {
@@ -259,20 +265,40 @@ impl Hub {
             }
             if let Ok((status, change)) = self.get_port_status(pipe, port as u8).await {
                 debug!("port {} status: {:?}\n change: {:?}", port, status, change);
-                if change.connection() {
-                    unwrap!(self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeConnection)
-                        .await);
-                    if status.connected() {
-                        unwrap!(self.set_port_feature(pipe, port as u8, HubPortFeature::Reset).await);
-                    }
-                }
+
                 if change.reset() {
-                    unwrap!(self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeReset)
-                        .await);
+                    unwrap!(
+                        self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeReset)
+                            .await
+                    );
                     if !status.reset() {
-                        return Ok(Some(HubEvent::DeviceAttach { port: port as u8 }));
+                        return Ok(Some(HubEvent::DeviceAttach {
+                            port: port as u8,
+                            hub_addr: self.handle.addr_opt(),
+                        }));
                     } else {
                         error!("port {} reset changed but set to true", port);
+                    }
+                }
+
+                if !enumeration_in_progress {
+                    if change.connection() {
+                        unwrap!(
+                            self.clear_port_feature(
+                                pipe,
+                                port as u8,
+                                HubPortFeature::ChangeConnection
+                            )
+                            .await
+                        );
+                        if status.connected() {
+                            trace!("Resetting port {} on hub {}", port, self.handle.address());
+                            unwrap!(
+                                self.set_port_feature(pipe, port as u8, HubPortFeature::Reset)
+                                    .await
+                            );
+                            return Ok(Some(HubEvent::DeviceReset));
+                        }
                     }
                 }
             }
@@ -281,7 +307,11 @@ impl Hub {
     }
 
     // Main deal
-    pub async fn poll<D: Driver>(&mut self, pipe: &USBHostPipe<D>) -> Result<Option<HubEvent>, UsbHostError> {
+    pub async fn poll<D: Driver>(
+        &mut self,
+        pipe: &USBHostPipe<D>,
+        enumeration_in_progress: bool,
+    ) -> Result<Option<HubEvent>, UsbHostError> {
         // interrupt transfer with pipe
         let mut in_buf: PortChangeBitmask = BitArray::ZERO;
         let in_buf_len = pipe
@@ -290,7 +320,8 @@ impl Hub {
         match in_buf_len {
             Ok(len) => {
                 assert!(len > 0);
-                self.on_status_change(pipe, &in_buf).await
+                self.on_status_change(pipe, &in_buf, enumeration_in_progress)
+                    .await
             }
             Err(UsbHostError::NAK) => Ok(None),
             Err(e) => {
