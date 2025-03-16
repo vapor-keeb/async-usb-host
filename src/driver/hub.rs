@@ -8,7 +8,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::{AddressOption, DataTog, EndpointAddress, InterruptChannel},
+    types::{DataTog, EndpointAddress, DevInfo, InterruptChannel},
     DeviceHandle, Driver, Host,
 };
 
@@ -16,7 +16,7 @@ type PortChangeBitmask = BitArr!(for 128, in u8);
 
 pub(crate) struct Hub {
     handle: DeviceHandle,
-    parent_addr: AddressOption,
+    parent_addr: DevInfo,
     nr_ports: u8,
     ports_connected: BitArr!(for 128),
     interrupt_channel: InterruptChannel,
@@ -24,16 +24,16 @@ pub(crate) struct Hub {
 
 pub(crate) enum HubEvent {
     DeviceReset,
-    DeviceAttach { port: u8, hub_addr: AddressOption },
-    DeviceDetach { port: u8 },
+    DeviceAttach(DevInfo),
+    DeviceDetach(DevInfo),
 }
 
 impl Hub {
-    pub async fn new<D: Driver>(
-        pipe: &USBHostPipe<D>,
+    pub async fn new<D: Driver, const NR_DEVICES: usize>(
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         handle: DeviceHandle,
         _descriptor: DeviceDescriptor, // TODO: maybe check if this is a hub?
-        parent: AddressOption,
+        parent: DevInfo,
     ) -> Result<Self, UsbHostError> {
         // Pull Configuraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
@@ -176,9 +176,9 @@ impl Hub {
         Ok(hub)
     }
 
-    async fn clear_port_feature<D: Driver>(
+    async fn clear_port_feature<D: Driver, const NR_DEVICES: usize>(
         &mut self,
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         port: u8,
         feature: HubPortFeature,
     ) -> Result<(), UsbHostError> {
@@ -197,9 +197,9 @@ impl Hub {
         .map(|_| ())
     }
 
-    async fn set_port_feature<D: Driver>(
+    async fn set_port_feature<D: Driver, const NR_DEVICES: usize>(
         &mut self,
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         port: u8,
         feature: HubPortFeature,
     ) -> Result<(), UsbHostError> {
@@ -218,9 +218,9 @@ impl Hub {
         .map(|_| ())
     }
 
-    async fn get_port_status<D: Driver>(
+    async fn get_port_status<D: Driver, const NR_DEVICES: usize>(
         &mut self,
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         port: u8,
     ) -> Result<(HubPortStatus, HubPortStatusChange), UsbHostError> {
         // TODO: handle status change bits
@@ -251,9 +251,9 @@ impl Hub {
         }
     }
 
-    async fn on_status_change(
+    async fn on_status_change<D: Driver, const NR_DEVICES: usize>(
         &mut self,
-        pipe: &USBHostPipe<impl Driver>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         bitmask: &PortChangeBitmask,
         enumeration_in_progress: bool,
     ) -> Result<Option<HubEvent>, UsbHostError> {
@@ -266,32 +266,15 @@ impl Hub {
             if let Ok((status, change)) = self.get_port_status(pipe, port as u8).await {
                 debug!("port {} status: {:?}\n change: {:?}", port, status, change);
 
-                if change.reset() {
-                    unwrap!(
-                        self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeReset)
-                            .await
-                    );
-                    if !status.reset() {
-                        return Ok(Some(HubEvent::DeviceAttach {
-                            port: port as u8,
-                            hub_addr: self.handle.addr_opt(),
-                        }));
-                    } else {
-                        error!("port {} reset changed but set to true", port);
-                    }
-                }
-
-                if !enumeration_in_progress {
-                    if change.connection() {
-                        unwrap!(
+                if change.connection() {
+                    if status.connected() {
+                        if !enumeration_in_progress {
                             self.clear_port_feature(
                                 pipe,
                                 port as u8,
-                                HubPortFeature::ChangeConnection
+                                HubPortFeature::ChangeConnection,
                             )
-                            .await
-                        );
-                        if status.connected() {
+                            .await?;
                             trace!("Resetting port {} on hub {}", port, self.handle.address());
                             unwrap!(
                                 self.set_port_feature(pipe, port as u8, HubPortFeature::Reset)
@@ -299,6 +282,35 @@ impl Hub {
                             );
                             return Ok(Some(HubEvent::DeviceReset));
                         }
+                        // Enumeration in progress, wait for current enumeration to finish
+                    } else {
+                        self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeConnection)
+                            .await?;
+                        return Ok(Some(HubEvent::DeviceDetach(DevInfo::new(
+                            self.handle.address(),
+                            port as u8,
+                        ))));
+                    }
+                }
+
+                if change.reset() {
+                    if !enumeration_in_progress {
+                        error!(
+                            "port {} reset changed, but currently not in enumeration",
+                            port
+                        );
+                    }
+                    unwrap!(
+                        self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeReset)
+                            .await
+                    );
+                    if !status.reset() {
+                        return Ok(Some(HubEvent::DeviceAttach(DevInfo::new(
+                            self.handle.address(),
+                            port as u8,
+                        ))));
+                    } else {
+                        error!("port {} reset changed but set to true", port);
                     }
                 }
             }
@@ -307,9 +319,9 @@ impl Hub {
     }
 
     // Main deal
-    pub async fn poll<D: Driver>(
+    pub async fn poll<D: Driver, const NR_DEVICES: usize>(
         &mut self,
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         enumeration_in_progress: bool,
     ) -> Result<Option<HubEvent>, UsbHostError> {
         // interrupt transfer with pipe

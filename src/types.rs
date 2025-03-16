@@ -123,10 +123,7 @@ impl From<&EndpointDescriptor> for EndpointAddress {
         } else {
             EndpointDirection::In
         };
-        EndpointAddress {
-            number,
-            direction,
-        }
+        EndpointAddress { number, direction }
     }
 }
 
@@ -156,28 +153,50 @@ impl DataTog {
     }
 }
 
-
 #[derive(Copy, Clone)]
-pub struct AddressOption(u8);
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DevInfo {
+    /// 7-bit USB address and the highest bit being a "valid" flag
+    valid_parent_addr: u8,
+    port_on_parent: u8,
+}
 
-impl AddressOption {
+impl DevInfo {
     pub fn empty() -> Self {
-        AddressOption(0)
+        DevInfo {
+            valid_parent_addr: 0,
+            port_on_parent: 0,
+        }
     }
 
-    pub fn new(addr: u8) -> Self {
-        AddressOption(addr | 0x80u8)
+    pub fn root_device() -> Self {
+        DevInfo {
+            valid_parent_addr: 0x80,
+            port_on_parent: 0,
+        }
+    }
+
+    pub fn new(addr: u8, port: u8) -> Self {
+        assert!((addr & 0x7F) != 0);
+        DevInfo {
+            valid_parent_addr: 0x80 | addr,
+            port_on_parent: port,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0 & 0x80 == 0
+        self.valid_parent_addr & 0x80 == 0
     }
 
-    pub fn addr(&self) -> Option<u8> {
+    pub fn parent_addr(&self) -> Option<u8> {
         if self.is_empty() {
             None
         } else {
-            Some(self.0 & 0x7F)
+            Some(self.valid_parent_addr & 0x7F)
         }
+    }
+
+    pub fn port(&self) -> u8 {
+        self.port_on_parent
     }
 }

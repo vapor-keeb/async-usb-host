@@ -9,8 +9,8 @@ use crate::{
     descriptor::{parse_descriptor, DeviceDescriptor},
     errors::UsbHostError,
     request::{self, Request, StandardDeviceRequest},
-    types::{self, DataTog, InterruptChannel},
-    DeviceAddressAllocator, DeviceHandle, Driver, TRANSFER_TIMEOUT,
+    types::{self, DataTog, InterruptChannel, DevInfo},
+    DeviceAddressManager, DeviceHandle, Driver, TRANSFER_TIMEOUT,
 };
 
 // not Send anyways
@@ -34,12 +34,12 @@ pub trait Pipe {
     ) -> Result<(), UsbHostError>;
 }
 
-struct USBHostPipeInner<D: Driver> {
+struct USBHostPipeInner<D: Driver, const NR_DEVICES: usize> {
     pipe: D::Pipe,
-    address_alloc: DeviceAddressAllocator,
+    address_alloc: DeviceAddressManager<NR_DEVICES>,
 }
 
-impl<D: Driver> USBHostPipeInner<D> {
+impl<D: Driver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
     async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         #[cfg(not(target_endian = "little"))]
@@ -105,16 +105,16 @@ impl<D: Driver> USBHostPipeInner<D> {
     }
 }
 
-pub struct USBHostPipe<D: Driver> {
-    inner: Mutex<CriticalSectionRawMutex, USBHostPipeInner<D>>,
+pub struct USBHostPipe<D: Driver, const NR_DEVICES: usize> {
+    inner: Mutex<CriticalSectionRawMutex, USBHostPipeInner<D, NR_DEVICES>>,
 }
 
-impl<D: Driver> USBHostPipe<D> {
+impl<D: Driver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
     pub fn new(pipe: D::Pipe) -> Self {
         Self {
             inner: Mutex::new(USBHostPipeInner {
                 pipe,
-                address_alloc: DeviceAddressAllocator::new(),
+                address_alloc: DeviceAddressManager::new(),
             }),
         }
     }
@@ -122,9 +122,10 @@ impl<D: Driver> USBHostPipe<D> {
     pub async fn assign_device_address(
         &self,
         max_packet_size: u16,
+        parent: DevInfo,
     ) -> Result<DeviceHandle, UsbHostError> {
         let mut inner = self.inner.lock().await;
-        let handle = inner.address_alloc.alloc_device_address(max_packet_size);
+        let handle = inner.address_alloc.alloc_device_address(max_packet_size, parent);
 
         if let Err(e) = (async || {
             let request = Request {
@@ -291,13 +292,13 @@ impl<D: Driver> USBHostPipe<D> {
         Ok(bytes_received)
     }
 
-    pub async fn dev_attach(&self) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
+    pub async fn dev_attach(&self, parent: DevInfo) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
         let mut buffer: [u8; 18] = [0u8; 18];
         let d = self.get_device_descriptor(&mut buffer).await?;
         let max_packet_size = d.max_packet_size;
         trace!("DeviceDescriptor: {}", d);
 
-        let handle = self.assign_device_address(max_packet_size as u16).await?;
+        let handle = self.assign_device_address(max_packet_size as u16, parent).await?;
         trace!("Device addressed {}", handle.address());
 
         Ok((d.clone(), handle))

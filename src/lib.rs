@@ -4,7 +4,7 @@ use bus::BusWrap;
 use consts::UsbBaseClass;
 use core::{error, marker::PhantomData, task::Poll};
 use descriptor::DeviceDescriptor;
-use device_addr::DeviceAddressAllocator;
+use device_addr::DeviceAddressManager;
 use driver::hub::Hub;
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer};
@@ -12,7 +12,7 @@ use errors::UsbHostError;
 use futures::poll_select;
 use pipe::USBHostPipe;
 use request::Request;
-use types::{AddressOption, EndpointAddress, InterruptChannel};
+use types::{DevInfo, EndpointAddress, InterruptChannel};
 
 #[macro_use]
 mod macros;
@@ -77,15 +77,15 @@ pub enum HostEvent {
     Suspended,
 }
 
-pub struct Host<'a, D: Driver, const NR_HUBS: usize> {
+pub struct Host<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> {
     phantom: PhantomData<D>,
     bus: BusWrap<D>,
-    pipe: &'a USBHostPipe<D>,
+    pipe: &'a USBHostPipe<D, NR_DEVICES>,
     state: HostState<NR_HUBS>,
 }
 
-impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
-    pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<D>) -> Self {
+impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, NR_HUBS, NR_DEVICES> {
+    pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<D, NR_DEVICES>) -> Self {
         Host {
             bus: BusWrap::new(bus),
             pipe,
@@ -141,7 +141,7 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
     }
 
     async fn run_device_attached(
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         bus: &mut BusWrap<D>,
         hubs: &mut ArrayVec<Hub, NR_HUBS>,
         enumeration_in_progress: &mut bool,
@@ -180,7 +180,7 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
     }
 
     async fn run_device_attached_inner(
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         bus: &mut BusWrap<D>,
         hubs: &mut ArrayVec<Hub, NR_HUBS>,
         enumeration_in_progress: bool,
@@ -208,8 +208,8 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
                     trace!("device reset, enumeration begin");
                     Ok(Some(HostInternalEvent::EnumerationBegin))
                 }
-                driver::hub::HubEvent::DeviceAttach { port: _, hub_addr } => {
-                    match Self::enumerate_device(pipe, bus, hubs, hub_addr).await? {
+                driver::hub::HubEvent::DeviceAttach(hubinfo) => {
+                    match Self::enumerate_device(pipe, bus, hubs, hubinfo).await? {
                         Some((desc, handle)) => {
                             Ok(Some(HostInternalEvent::HostEvent(HostEvent::NewDevice {
                                 descriptor: desc,
@@ -219,8 +219,8 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
                         None => Ok(Some(HostInternalEvent::EnumerationEnd)),
                     }
                 }
-                driver::hub::HubEvent::DeviceDetach { port } => {
-                    trace!("device detached from port {}", port);
+                driver::hub::HubEvent::DeviceDetach(hubinfo) => {
+                    trace!("device detached {}", hubinfo);
                     Ok(Some(HostInternalEvent::HostEvent(HostEvent::DeviceDetach)))
                 }
             },
@@ -250,7 +250,7 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
 
     async fn enumerate_root(&mut self) -> Option<HostEvent> {
         let mut hubs = ArrayVec::new();
-        match Self::enumerate_device(&self.pipe, &mut self.bus, &mut hubs, AddressOption::empty())
+        match Self::enumerate_device(&self.pipe, &mut self.bus, &mut hubs, DevInfo::root_device())
             .await
         {
             Ok(event) => {
@@ -272,12 +272,12 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
     /// Ok(Some((descriptor, handle))) if the device is not a hub
     /// Err if there is an error
     async fn enumerate_device(
-        pipe: &USBHostPipe<D>,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
         bus: &mut BusWrap<D>,
         hubs: &mut ArrayVec<Hub, NR_HUBS>,
-        parent: AddressOption,
+        hubinfo: DevInfo,
     ) -> Result<Option<(DeviceDescriptor, DeviceHandle)>, UsbHostError> {
-        let pipe_future = pipe.dev_attach();
+        let pipe_future = pipe.dev_attach(hubinfo);
         let bus_future = bus.wait_until_detach();
 
         let (descriptor, handle) = poll_select(pipe_future, bus_future, |either| match either {
@@ -290,7 +290,7 @@ impl<'a, D: Driver, const NR_HUBS: usize> Host<'a, D, NR_HUBS> {
         .await?;
 
         if descriptor.device_class == UsbBaseClass::Hub.into() {
-            let hub = driver::hub::Hub::new(pipe, handle, descriptor, parent).await?;
+            let hub = driver::hub::Hub::new(pipe, handle, descriptor, hubinfo).await?;
             hubs.try_push(hub).map_err(|_| UsbHostError::HubCapacity)?;
 
             Ok(None)
