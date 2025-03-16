@@ -153,8 +153,9 @@ impl DataTog {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub struct DevInfo {
     /// 7-bit USB address and the highest bit being a "valid" flag
     valid_parent_addr: u8,

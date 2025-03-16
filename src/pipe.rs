@@ -7,9 +7,10 @@ use embassy_time::Timer;
 
 use crate::{
     descriptor::{parse_descriptor, DeviceDescriptor},
+    device_addr::DeviceDisconnectMask,
     errors::UsbHostError,
     request::{self, Request, StandardDeviceRequest},
-    types::{self, DataTog, InterruptChannel, DevInfo},
+    types::{self, DataTog, DevInfo, InterruptChannel},
     DeviceAddressManager, DeviceHandle, Driver, TRANSFER_TIMEOUT,
 };
 
@@ -125,7 +126,9 @@ impl<D: Driver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         parent: DevInfo,
     ) -> Result<DeviceHandle, UsbHostError> {
         let mut inner = self.inner.lock().await;
-        let handle = inner.address_alloc.alloc_device_address(max_packet_size, parent);
+        let handle = inner
+            .address_alloc
+            .alloc_device_address(max_packet_size, parent);
 
         if let Err(e) = (async || {
             let request = Request {
@@ -292,15 +295,30 @@ impl<D: Driver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         Ok(bytes_received)
     }
 
-    pub async fn dev_attach(&self, parent: DevInfo) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
+    pub async fn dev_attach(
+        &self,
+        parent: DevInfo,
+    ) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
         let mut buffer: [u8; 18] = [0u8; 18];
         let d = self.get_device_descriptor(&mut buffer).await?;
         let max_packet_size = d.max_packet_size;
         trace!("DeviceDescriptor: {}", d);
 
-        let handle = self.assign_device_address(max_packet_size as u16, parent).await?;
+        let handle = self
+            .assign_device_address(max_packet_size as u16, parent)
+            .await?;
         trace!("Device addressed {}", handle.address());
 
         Ok((d.clone(), handle))
+    }
+
+    pub async fn root_detach(&self) -> DeviceDisconnectMask {
+        let mut inner = self.inner.lock().await;
+        inner.address_alloc.free_all_addresses()
+    }
+
+    pub async fn dev_detach(&self, dev_info: DevInfo) -> DeviceDisconnectMask {
+        let mut inner = self.inner.lock().await;
+        inner.address_alloc.free_subtree(dev_info)
     }
 }

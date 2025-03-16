@@ -15,10 +15,7 @@ use crate::{
 type PortChangeBitmask = BitArr!(for 128, in u8);
 
 pub(crate) struct Hub {
-    handle: DeviceHandle,
-    parent_addr: DevInfo,
-    nr_ports: u8,
-    ports_connected: BitArr!(for 128),
+    pub(crate) handle: DeviceHandle,
     interrupt_channel: InterruptChannel,
 }
 
@@ -33,7 +30,6 @@ impl Hub {
         pipe: &USBHostPipe<D, NR_DEVICES>,
         handle: DeviceHandle,
         _descriptor: DeviceDescriptor, // TODO: maybe check if this is a hub?
-        parent: DevInfo,
     ) -> Result<Self, UsbHostError> {
         // Pull Configuraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
@@ -145,9 +141,6 @@ impl Hub {
 
         let mut hub = Hub {
             handle,
-            parent_addr: parent,
-            nr_ports: hub_desc.number_of_ports,
-            ports_connected: BitArray::ZERO,
             interrupt_channel: InterruptChannel {
                 device_handle: handle,
                 endpoint_address,

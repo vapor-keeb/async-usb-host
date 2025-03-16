@@ -4,7 +4,7 @@ use bus::BusWrap;
 use consts::UsbBaseClass;
 use core::{marker::PhantomData, task::Poll};
 use descriptor::DeviceDescriptor;
-use device_addr::DeviceAddressManager;
+use device_addr::{DeviceAddressManager, DeviceDisconnectMask};
 use driver::hub::Hub;
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer};
@@ -64,7 +64,9 @@ pub enum HostEvent {
         descriptor: DeviceDescriptor,
         handle: DeviceHandle,
     },
-    DeviceDetach,
+    DeviceDetach {
+        mask: DeviceDisconnectMask,
+    },
     ControlTransferResponse {
         result: Result<usize, UsbHostError>,
         buffer: &'static mut [u8],
@@ -83,7 +85,9 @@ pub struct Host<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> {
     state: HostState<NR_HUBS>,
 }
 
-impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, NR_HUBS, NR_DEVICES> {
+impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize>
+    Host<'a, D, NR_HUBS, NR_DEVICES>
+{
     pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<D, NR_DEVICES>) -> Self {
         Host {
             bus: BusWrap::new(bus),
@@ -152,7 +156,12 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, N
                     (None, Some(HostState::EnumerateRoot))
                 }
                 Event::DeviceDetach => {
-                    (Some(HostEvent::DeviceDetach), Some(HostState::Disconnected))
+                    let mask = pipe.root_detach().await;
+
+                    (
+                        Some(HostEvent::DeviceDetach { mask }),
+                        Some(HostState::Disconnected),
+                    )
                 }
                 Event::Suspend => (None, Some(HostState::Suspended)),
                 Event::Resume => (None, Some(HostState::Disconnected)),
@@ -174,6 +183,21 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, N
             Err(e) => {
                 error!("{}", e);
                 (None, Some(HostState::Disconnected))
+            }
+        }
+    }
+
+    fn remove_disconnected_hubs(hubs: &mut ArrayVec<Hub, NR_HUBS>, mask: &mut DeviceDisconnectMask) {
+        // Remove disconnected hubs from both the hubs array and the mask
+        let mut i = 0;
+        while i < hubs.len() {
+            let hub_addr = hubs[i].handle.address() as usize;
+            if mask.iter().any(|addr| hub_addr == addr) {
+                trace!("removing disconnected hub {}", hub_addr);
+                hubs.swap_remove(i);
+                mask.remove(hub_addr);
+            } else {
+                i += 1;
             }
         }
     }
@@ -212,7 +236,7 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, N
                         Some((desc, handle)) => {
                             Ok(Some(HostInternalEvent::HostEvent(HostEvent::NewDevice {
                                 descriptor: desc,
-                                handle: handle,
+                                handle,
                             })))
                         }
                         None => Ok(Some(HostInternalEvent::EnumerationEnd)),
@@ -220,7 +244,11 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, N
                 }
                 driver::hub::HubEvent::DeviceDetach(hubinfo) => {
                     trace!("device detached {}", hubinfo);
-                    Ok(Some(HostInternalEvent::HostEvent(HostEvent::DeviceDetach)))
+                    let mut mask = pipe.dev_detach(hubinfo).await;
+                    Self::remove_disconnected_hubs(hubs, &mut mask);
+                    Ok(Some(HostInternalEvent::HostEvent(
+                        HostEvent::DeviceDetach { mask },
+                    )))
                 }
             },
             Either::First(None) => Ok(None),
@@ -289,7 +317,7 @@ impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> Host<'a, D, N
         .await?;
 
         if descriptor.device_class == UsbBaseClass::Hub.into() {
-            let hub = driver::hub::Hub::new(pipe, handle, descriptor, hubinfo).await?;
+            let hub = driver::hub::Hub::new(pipe, handle, descriptor).await?;
             hubs.try_push(hub).map_err(|_| UsbHostError::HubCapacity)?;
 
             Ok(None)
