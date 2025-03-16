@@ -1,5 +1,3 @@
-use core::future::Future;
-
 use crate::Driver;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

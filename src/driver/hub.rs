@@ -1,4 +1,4 @@
-use bitvec::{array::BitArray, bitarr, order::Msb0, BitArr};
+use bitvec::{array::BitArray, BitArr};
 
 use crate::{
     descriptor::{
@@ -8,8 +8,8 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::{DataTog,  DevInfo, InterruptChannel},
-    DeviceHandle, Driver, Host,
+    types::{DataTog, DevInfo, InterruptChannel},
+    DeviceHandle, Driver,
 };
 
 type PortChangeBitmask = BitArr!(for 128, in u8);

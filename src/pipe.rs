@@ -1,8 +1,7 @@
 use core::mem::transmute;
 
-use arrayvec::ArrayVec;
 use embassy_futures::select::{select, Either};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, pipe};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Timer;
 
 use crate::{

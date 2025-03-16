@@ -34,6 +34,7 @@ macro_rules! debug {
     };
 }
 
+#[allow(unused_macros)]
 #[collapse_debuginfo(yes)]
 macro_rules! info {
     ($s:literal $(, $x:expr)* $(,)?) => {
