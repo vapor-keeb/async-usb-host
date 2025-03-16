@@ -2,7 +2,7 @@
 use arrayvec::ArrayVec;
 use bus::BusWrap;
 use consts::UsbBaseClass;
-use core::{error, marker::PhantomData, task::Poll};
+use core::{marker::PhantomData, task::Poll};
 use descriptor::DeviceDescriptor;
 use device_addr::DeviceAddressManager;
 use driver::hub::Hub;
@@ -11,8 +11,7 @@ use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use futures::poll_select;
 use pipe::USBHostPipe;
-use request::Request;
-use types::{DevInfo, EndpointAddress, InterruptChannel};
+use types::DevInfo;
 
 #[macro_use]
 mod macros;

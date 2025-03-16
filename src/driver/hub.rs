@@ -8,7 +8,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::{DataTog, EndpointAddress, DevInfo, InterruptChannel},
+    types::{DataTog,  DevInfo, InterruptChannel},
     DeviceHandle, Driver, Host,
 };
 
