@@ -1,6 +1,7 @@
 use crate::{errors::UsbHostError, types::Bcd16};
 
 pub mod hub;
+pub mod hid;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
