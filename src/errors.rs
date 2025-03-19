@@ -16,6 +16,7 @@ pub enum UsbHostError {
     TransferTimeout,
     InvalidState,
     InvalidResponse,
+    UnexpectedDevice,
     HubCapacity,
     Detached,
 }

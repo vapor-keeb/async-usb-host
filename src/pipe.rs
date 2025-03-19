@@ -90,6 +90,31 @@ impl<D: Driver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
         }
     }
 
+    async fn data_out_with_retry(
+        &mut self,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &[u8],
+    ) -> Result<(), UsbHostError> {
+        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
+        let mut data_out_with_retry = async || loop {
+            match self.pipe.data_out(endpoint, tog, buf).await {
+                Ok(()) => return Ok(()),
+                Err(UsbHostError::NAK) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        };
+        let data_out_fut = data_out_with_retry();
+        match select(timeout_fut, data_out_fut).await {
+            Either::First(_) => Err(UsbHostError::TransferTimeout),
+            Either::Second(r) => r,
+        }
+    }
+
     async fn data_out(
         &mut self,
         endpoint: u8,
@@ -213,7 +238,7 @@ impl<D: Driver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         }
 
         // Status stage
-        inner.data_out(0, DataTog::DATA1, &[]).await?;
+        inner.data_out_with_retry(0, DataTog::DATA1, &[]).await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         let dev_desc = parse_descriptor(buf)
@@ -287,7 +312,7 @@ impl<D: Driver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
                 inner.data_in_with_retry(0, DataTog::DATA1, &mut []).await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                inner.data_out(0, DataTog::DATA1, &[]).await?;
+                inner.data_out_with_retry(0, DataTog::DATA1, &[]).await?;
             }
         }
 

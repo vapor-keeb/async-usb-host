@@ -122,7 +122,7 @@ impl Hub {
         while !cfg_buf.is_empty() {
             let desc = parse_descriptor(cfg_buf)?;
             let len = match desc {
-                Descriptor::Device(device_descriptor) => device_descriptor.length,
+                Descriptor::Device(_) => return Err(UsbHostError::InvalidState),
                 Descriptor::Configuration(configuration_descriptor) => {
                     configuration_descriptor.length
                 }

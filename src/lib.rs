@@ -2,11 +2,11 @@
 use arrayvec::ArrayVec;
 use bus::BusWrap;
 use consts::UsbBaseClass;
-use core::{marker::PhantomData, task::Poll};
+use core::marker::PhantomData;
 use descriptor::DeviceDescriptor;
 use device_addr::{DeviceAddressManager, DeviceDisconnectMask};
 use driver::hub::Hub;
-use embassy_futures::select::{self, select, Either};
+use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer};
 use errors::UsbHostError;
 use pipe::USBHostPipe;
