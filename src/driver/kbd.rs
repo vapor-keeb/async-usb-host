@@ -26,6 +26,10 @@ impl<'a, D: Driver, const NR_DEVICES: usize> HidKbd<'a, D, NR_DEVICES> {
         Ok(kbd)
     }
 
+    pub async fn run(self) -> Result<(), UsbHostError> {
+        loop {}
+    }
+
     async fn configure(&self) -> Result<(), UsbHostError> {
         // Pull Configuration Descriptor
         let mut buf: [u8; 255] = [0; 255];
