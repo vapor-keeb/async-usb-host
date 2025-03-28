@@ -10,6 +10,28 @@ pub struct HIDDescriptor {
     pub num_descriptors: u8,
 }
 
+// HID descriptor type constant
+pub const HID_DESCRIPTOR_TYPE: u8 = 0x21;
+
+impl HIDDescriptor {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        // USB uses little-endian, so ensure we're compiling for a compatible target
+        #[cfg(target_endian = "big")]
+        compile_error!("USB protocol uses little-endian byte order, but compiling for big-endian target");
+
+        if data.len() < core::mem::size_of::<Self>() {
+            return None;
+        }
+        
+        // Safety: We've checked the length and the struct is #[repr(C, packed)]
+        let descriptor = unsafe {
+            core::ptr::read_unaligned(data.as_ptr() as *const Self)
+        };
+        
+        Some(descriptor)
+    }
+}
+
 #[cfg(feature = "defmt")]
 impl defmt::Format for HIDDescriptor {
     fn format(&self, fmt: defmt::Formatter) {
