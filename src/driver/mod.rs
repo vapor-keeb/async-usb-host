@@ -1,9 +1,18 @@
 /// USB Hub class driver, private because it is only used by the main driver.
 ///
-use core::{future::Future, pin::Pin};
+use core::{
+    future::Future,
+    pin::{pin, Pin},
+    result,
+};
 
 use crate::{
-    descriptor::DeviceDescriptor, driver::kbd::HidKbd, errors::UsbHostError, futures::select_pin_array, pipe::USBHostPipe, DeviceHandle, HostDriver
+    descriptor::DeviceDescriptor,
+    driver::kbd::HidKbd,
+    errors::UsbHostError,
+    futures::{select_pin_array, StaticUnpinPoller},
+    pipe::USBHostPipe,
+    DeviceHandle, HostDriver,
 };
 use embassy_futures::select::{select, Either};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
@@ -30,42 +39,41 @@ impl<'a, D: HostDriver, const MAX_DEVICES: usize> USBHostDriver<'a, D, MAX_DEVIC
         &mut self,
         f: F,
     ) {
-        let mut device_futures: [Option<Fut>; MAX_DEVICES] = core::array::from_fn(|_| None);
-        let mut pinned: Pin<&mut [Option<Fut>; MAX_DEVICES]> =
-            unsafe { Pin::new_unchecked(&mut device_futures) };
+        let poller = StaticUnpinPoller::<Fut, MAX_DEVICES>::new();
+        let mut poller = pin!(poller);
 
         loop {
             let new_dev_fut = self.new_dev.receive();
-            match select(new_dev_fut, select_pin_array(&mut pinned)).await {
-                Either::First((device, descriptor)) => {
-                    let kbd = HidKbd::try_attach(self.pipe, device, descriptor).await;
-                    match kbd {
-                        Ok(kbd) => {
-                            // Find an empty slot for the new device
-                            if let Some(empty_slot) = unsafe { pinned.as_mut().get_unchecked_mut() }
-                                .iter_mut()
-                                .position(|slot| slot.is_none())
-                            {
-                                unsafe {
-                                    pinned.as_mut().get_unchecked_mut()[empty_slot] =
-                                        Some(f(kbd, self.pipe));
-                                }
-                                trace!("Device added to slot {}", empty_slot);
-                            } else {
-                                error!("No empty slots available for new device");
+            let (device, descriptor) = if poller.as_mut().is_empty() {
+                new_dev_fut.await
+            } else {
+                match select(new_dev_fut, poller.as_mut()).await {
+                    Either::First((device, descriptor)) => (device, descriptor),
+                    Either::Second(Some((idx, result))) => {
+                        match result {
+                            Ok(_) => {
+                                trace!("Device at slot {} completed successfully", idx);
                             }
+                            Err(e) => error!("Device error at slot {}: {}", idx, e),
                         }
-                        Err(e) => {
-                            error!("Failed to attach keyboard: {}", e);
-                        }
+                        continue;
+                        // The slot is already cleared by the select_pin_array implementation
+                    }
+                    Either::Second(None) => {
+                        continue;
                     }
                 }
-                Either::Second((result, idx)) => {
-                    match result {
-                        Ok(_) => trace!("Device at slot {} completed successfully", idx),
-                        Err(e) => error!("Device error at slot {}: {}", idx, e),
+            };
+            let kbd = HidKbd::try_attach(self.pipe, device, descriptor).await;
+            match kbd {
+                Ok(kbd) => {
+                    // Find an empty slot for the new device
+                    if let Err(e) = poller.as_mut().insert(f(kbd, self.pipe)) {
+                        error!("No empty slots available for new device: {}", e);
                     }
-                    // The slot is already cleared by the select_pin_array implementation
+                }
+                Err(e) => {
+                    error!("Failed to attach keyboard: {}", e);
                 }
             }
         }
