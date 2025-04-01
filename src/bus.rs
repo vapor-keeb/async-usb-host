@@ -1,4 +1,4 @@
-use crate::Driver;
+use crate::HostDriver;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Event {
@@ -15,9 +15,9 @@ pub trait Bus {
     async fn poll(&mut self) -> Event;
 }
 
-pub(crate) struct BusWrap<D: Driver>(D::Bus);
+pub(crate) struct BusWrap<D: HostDriver>(D::Bus);
 
-impl<D: Driver> BusWrap<D> {
+impl<D: HostDriver> BusWrap<D> {
     pub fn new(bus: D::Bus) -> Self {
         Self(bus)
     }

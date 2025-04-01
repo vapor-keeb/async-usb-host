@@ -3,7 +3,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     types::{DataTog, EndpointAddress, EndpointDirection, InterruptChannel},
-    DeviceHandle, Driver,
+    DeviceHandle, HostDriver,
 };
 
 pub struct HidKbd {
@@ -12,7 +12,7 @@ pub struct HidKbd {
 }
 
 impl HidKbd {
-    pub async fn try_attach<D: Driver, const NR_DEVICES: usize>(
+    pub async fn try_attach<D: HostDriver, const NR_DEVICES: usize>(
         pipe: &USBHostPipe<D, NR_DEVICES>,
         device: DeviceHandle,
         desc: DeviceDescriptor,
@@ -32,7 +32,7 @@ impl HidKbd {
         Ok(kbd)
     }
 
-    pub async fn run<'a, D: Driver, const NR_DEVICES: usize>(
+    pub async fn run<'a, D: HostDriver, const NR_DEVICES: usize>(
         self,
         pipe: &'a USBHostPipe<D, NR_DEVICES>
     ) -> Result<(), UsbHostError> {
@@ -60,8 +60,8 @@ impl HidKbd {
                         prev_report.copy_from_slice(&buf);
                     }
                 }
-                Err(UsbHostError::TransferTimeout) => {
-                    // Timeouts are normal for interrupt endpoints, just continue
+                Err(UsbHostError::NAK) => {
+                    // NAK are normal for interrupt endpoints, just continue
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -150,7 +150,7 @@ impl HidKbd {
         }
     }
 
-    async fn configure<D: Driver, const NR_DEVICES: usize>(&mut self, pipe: &USBHostPipe<D, NR_DEVICES>) -> Result<(), UsbHostError> {
+    async fn configure<D: HostDriver, const NR_DEVICES: usize>(&mut self, pipe: &USBHostPipe<D, NR_DEVICES>) -> Result<(), UsbHostError> {
         // Pull Configuration Descriptor
         let mut buf: [u8; 255] = [0; 255];
         let len = pipe

@@ -9,7 +9,7 @@ use crate::{
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
     types::{DataTog, DevInfo, InterruptChannel},
-    DeviceHandle, Driver,
+    DeviceHandle, HostDriver,
 };
 
 type PortChangeBitmask = BitArr!(for 128, in u8);
@@ -26,7 +26,7 @@ pub(crate) enum HubEvent {
 }
 
 impl Hub {
-    pub async fn new<D: Driver, const NR_DEVICES: usize>(
+    pub async fn new<D: HostDriver, const NR_DEVICES: usize>(
         pipe: &USBHostPipe<D, NR_DEVICES>,
         handle: DeviceHandle,
         _descriptor: DeviceDescriptor, // TODO: maybe check if this is a hub?
@@ -169,7 +169,7 @@ impl Hub {
         Ok(hub)
     }
 
-    async fn clear_port_feature<D: Driver, const NR_DEVICES: usize>(
+    async fn clear_port_feature<D: HostDriver, const NR_DEVICES: usize>(
         &mut self,
         pipe: &USBHostPipe<D, NR_DEVICES>,
         port: u8,
@@ -190,7 +190,7 @@ impl Hub {
         .map(|_| ())
     }
 
-    async fn set_port_feature<D: Driver, const NR_DEVICES: usize>(
+    async fn set_port_feature<D: HostDriver, const NR_DEVICES: usize>(
         &mut self,
         pipe: &USBHostPipe<D, NR_DEVICES>,
         port: u8,
@@ -211,7 +211,7 @@ impl Hub {
         .map(|_| ())
     }
 
-    async fn get_port_status<D: Driver, const NR_DEVICES: usize>(
+    async fn get_port_status<D: HostDriver, const NR_DEVICES: usize>(
         &mut self,
         pipe: &USBHostPipe<D, NR_DEVICES>,
         port: u8,
@@ -244,7 +244,7 @@ impl Hub {
         }
     }
 
-    async fn on_status_change<D: Driver, const NR_DEVICES: usize>(
+    async fn on_status_change<D: HostDriver, const NR_DEVICES: usize>(
         &mut self,
         pipe: &USBHostPipe<D, NR_DEVICES>,
         bitmask: &PortChangeBitmask,
@@ -312,7 +312,7 @@ impl Hub {
     }
 
     // Main deal
-    pub async fn poll<D: Driver, const NR_DEVICES: usize>(
+    pub async fn poll<D: HostDriver, const NR_DEVICES: usize>(
         &mut self,
         pipe: &USBHostPipe<D, NR_DEVICES>,
         enumeration_in_progress: bool,

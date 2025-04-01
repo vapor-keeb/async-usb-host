@@ -18,6 +18,7 @@ mod macros;
 pub mod consts;
 pub mod descriptor;
 mod device_addr;
+pub mod futures;
 pub mod driver;
 pub mod errors;
 pub mod request;
@@ -31,7 +32,7 @@ pub use pipe::Pipe;
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_millis(500);
 
-pub trait Driver {
+pub trait HostDriver {
     type Bus: Bus;
     type Pipe: Pipe;
 
@@ -76,14 +77,14 @@ pub enum HostEvent {
     Suspended,
 }
 
-pub struct Host<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize> {
+pub struct Host<'a, D: HostDriver, const NR_HUBS: usize, const NR_DEVICES: usize> {
     phantom: PhantomData<D>,
     bus: BusWrap<D>,
     pipe: &'a USBHostPipe<D, NR_DEVICES>,
     state: HostState<NR_HUBS>,
 }
 
-impl<'a, D: Driver, const NR_HUBS: usize, const NR_DEVICES: usize>
+impl<'a, D: HostDriver, const NR_HUBS: usize, const NR_DEVICES: usize>
     Host<'a, D, NR_HUBS, NR_DEVICES>
 {
     pub fn new(bus: D::Bus, pipe: &'a USBHostPipe<D, NR_DEVICES>) -> Self {

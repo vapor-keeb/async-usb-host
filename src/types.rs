@@ -136,6 +136,15 @@ pub struct InterruptChannel {
     pub(crate) tog: DataTog,
 }
 
+impl InterruptChannel {
+    pub fn new(device_handle: DeviceHandle, endpoint_address: EndpointAddress) -> Self {
+        Self {
+            device_handle,
+            endpoint_address,
+            tog: DataTog::DATA0,
+        }
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]

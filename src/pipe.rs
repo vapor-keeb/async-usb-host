@@ -10,7 +10,7 @@ use crate::{
     errors::UsbHostError,
     request::{self, Request, StandardDeviceRequest},
     types::{self, DataTog, DevInfo, InterruptChannel},
-    DeviceAddressManager, DeviceHandle, Driver, TRANSFER_TIMEOUT,
+    DeviceAddressManager, DeviceHandle, HostDriver, TRANSFER_TIMEOUT,
 };
 
 // not Send anyways
@@ -34,12 +34,12 @@ pub trait Pipe {
     ) -> Result<(), UsbHostError>;
 }
 
-struct USBHostPipeInner<D: Driver, const NR_DEVICES: usize> {
+struct USBHostPipeInner<D: HostDriver, const NR_DEVICES: usize> {
     pipe: D::Pipe,
     address_alloc: DeviceAddressManager<NR_DEVICES>,
 }
 
-impl<D: Driver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
+impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
     async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         #[cfg(not(target_endian = "little"))]
@@ -130,11 +130,11 @@ impl<D: Driver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
     }
 }
 
-pub struct USBHostPipe<D: Driver, const NR_DEVICES: usize> {
+pub struct USBHostPipe<D: HostDriver, const NR_DEVICES: usize> {
     inner: Mutex<CriticalSectionRawMutex, USBHostPipeInner<D, NR_DEVICES>>,
 }
 
-impl<D: Driver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
+impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
     pub fn new(pipe: D::Pipe) -> Self {
         Self {
             inner: Mutex::new(USBHostPipeInner {
