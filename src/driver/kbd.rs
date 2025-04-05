@@ -6,69 +6,14 @@ use crate::{
     DeviceHandle, HostDriver,
 };
 
+use super::USBHostDeviceDriver;
+
 pub struct HidKbd {
     device: DeviceHandle,
     interrupt_channel: Option<InterruptChannel>,
 }
 
 impl HidKbd {
-    pub async fn try_attach<D: HostDriver, const NR_DEVICES: usize>(
-        pipe: &USBHostPipe<D, NR_DEVICES>,
-        device: DeviceHandle,
-        desc: DeviceDescriptor,
-    ) -> Result<Self, UsbHostError> {
-        // HID use the interface class to declare their class
-        if desc.device_class != 0 {
-            return Err(UsbHostError::UnexpectedDevice);
-        }
-
-        let mut kbd = Self {
-            device,
-            interrupt_channel: None,
-        };
-
-        kbd.configure(pipe).await?;
-
-        Ok(kbd)
-    }
-
-    pub async fn run<'a, D: HostDriver, const NR_DEVICES: usize>(
-        self,
-        pipe: &'a USBHostPipe<D, NR_DEVICES>
-    ) -> Result<(), UsbHostError> {
-        let mut prev_report = [0u8; 8];
-        let mut buf = [0u8; 8]; // Standard HID keyboard report is 8 bytes
-
-        let Self {
-            device: _, // Mark device as unused for now
-            interrupt_channel,
-        } = self;
-
-        // Ensure we have an interrupt channel configured
-        let mut interrupt_channel = interrupt_channel.ok_or(UsbHostError::InvalidState)?;
-
-        loop {
-            // Poll the interrupt endpoint for keyboard reports
-            match pipe
-                .interrupt_transfer(&mut interrupt_channel, &mut buf)
-                .await
-            {
-                Ok(len) => {
-                    if len > 0 && buf != prev_report {
-                        // Process the keyboard report
-                        Self::process_keyboard_report(&buf);
-                        prev_report.copy_from_slice(&buf);
-                    }
-                }
-                Err(UsbHostError::NAK) => {
-                    // NAK are normal for interrupt endpoints, just continue
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     fn process_keyboard_report(report: &[u8]) {
         // Standard HID keyboard report format:
         // Byte 0: Modifier keys (CTRL, SHIFT, ALT, etc.)
@@ -286,4 +231,64 @@ impl HidKbd {
             Err(UsbHostError::InvalidResponse)
         }
     }
+}
+
+impl USBHostDeviceDriver for HidKbd {
+    async fn try_attach<D: HostDriver, const NR_DEVICES: usize>(
+        pipe: &USBHostPipe<D, NR_DEVICES>,
+        device: DeviceHandle,
+        desc: DeviceDescriptor,
+    ) -> Result<Self, UsbHostError> {
+        // HID use the interface class to declare their class
+        if desc.device_class != 0 {
+            return Err(UsbHostError::UnexpectedDevice);
+        }
+
+        let mut kbd = Self {
+            device,
+            interrupt_channel: None,
+        };
+
+        kbd.configure(pipe).await?;
+
+        Ok(kbd)
+    }
+
+    async fn run<'a, D: HostDriver, const NR_DEVICES: usize>(
+        self,
+        pipe: &'a USBHostPipe<D, NR_DEVICES>
+    ) -> Result<(), UsbHostError> {
+        let mut prev_report = [0u8; 8];
+        let mut buf = [0u8; 8]; // Standard HID keyboard report is 8 bytes
+
+        let Self {
+            device: _, // Mark device as unused for now
+            interrupt_channel,
+        } = self;
+
+        // Ensure we have an interrupt channel configured
+        let mut interrupt_channel = interrupt_channel.ok_or(UsbHostError::InvalidState)?;
+
+        loop {
+            // Poll the interrupt endpoint for keyboard reports
+            match pipe
+                .interrupt_transfer(&mut interrupt_channel, &mut buf)
+                .await
+            {
+                Ok(len) => {
+                    if len > 0 && buf != prev_report {
+                        // Process the keyboard report
+                        Self::process_keyboard_report(&buf);
+                        prev_report.copy_from_slice(&buf);
+                    }
+                }
+                Err(UsbHostError::NAK) => {
+                    // NAK are normal for interrupt endpoints, just continue
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
 }

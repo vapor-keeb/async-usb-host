@@ -1,14 +1,10 @@
 /// USB Hub class driver, private because it is only used by the main driver.
 ///
-use core::{future::Future, pin::pin};
+use core::{future::Future, marker::PhantomData, pin::pin};
 
 use crate::{
-    descriptor::DeviceDescriptor,
-    driver::kbd::HidKbd,
-    errors::UsbHostError,
-    futures::StaticUnpinPoller,
-    pipe::USBHostPipe,
-    DeviceHandle, HostDriver,
+    descriptor::DeviceDescriptor, driver::kbd::HidKbd, errors::UsbHostError,
+    futures::StaticUnpinPoller, pipe::USBHostPipe, DeviceHandle, HostDriver,
 };
 use embassy_futures::select::{select, Either};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
@@ -18,24 +14,33 @@ pub mod kbd;
 
 pub type DeviceChannel = Channel<CriticalSectionRawMutex, (DeviceHandle, DeviceDescriptor), 1>;
 
-pub struct USBHostDriver<'a, D: HostDriver, const MAX_DEVICES: usize = 4> {
-    pipe: &'a USBHostPipe<D, 16>,
-    new_dev: &'a DeviceChannel,
+#[allow(async_fn_in_trait)]
+pub trait USBHostDeviceDriver: Sized {
+    async fn try_attach<D: HostDriver, const NR_DEVICES: usize>(
+        pipe: &USBHostPipe<D, NR_DEVICES>,
+        device: DeviceHandle,
+        desc: DeviceDescriptor,
+    ) -> Result<Self, UsbHostError>;
+
+    async fn run<D: HostDriver, const NR_DEVICES: usize>(
+        self,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
+    ) -> Result<(), UsbHostError>;
 }
 
-impl<'a, D: HostDriver, const MAX_DEVICES: usize> USBHostDriver<'a, D, MAX_DEVICES> {
-    pub fn new(pipe: &'a USBHostPipe<D, 16>, new_dev: &'a DeviceChannel) -> Self {
-        Self { pipe, new_dev }
+pub struct USBDeviceDispatcher<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize> {
+    pipe: &'a USBHostPipe<HD, NR_DEVICES>,
+    new_dev: &'a DeviceChannel,
+    _phantom: PhantomData<HDD>,
+}
+
+impl<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize> USBDeviceDispatcher<'a, HDD, HD, NR_DEVICES> {
+    pub fn new(pipe: &'a USBHostPipe<HD, NR_DEVICES>, new_dev: &'a DeviceChannel) -> Self {
+        Self { pipe, new_dev, _phantom: PhantomData }
     }
 
-    pub async fn run<
-        Fut: Future<Output = Result<(), UsbHostError>>,
-        F: Fn(HidKbd, &'a USBHostPipe<D, 16>) -> Fut,
-    >(
-        &mut self,
-        f: F,
-    ) {
-        let poller = StaticUnpinPoller::<Fut, MAX_DEVICES>::new();
+    pub async fn run(&mut self) {
+        let poller = StaticUnpinPoller::<_, NR_DEVICES>::new();
         let mut poller = pin!(poller);
 
         loop {
@@ -53,18 +58,17 @@ impl<'a, D: HostDriver, const MAX_DEVICES: usize> USBHostDriver<'a, D, MAX_DEVIC
                             Err(e) => error!("Device error at slot {}: {}", idx, e),
                         }
                         continue;
-                        // The slot is already cleared by the select_pin_array implementation
                     }
                     Either::Second(None) => {
                         continue;
                     }
                 }
             };
-            let kbd = HidKbd::try_attach(self.pipe, device, descriptor).await;
-            match kbd {
-                Ok(kbd) => {
+            let hdd = HDD::try_attach(self.pipe, device, descriptor).await;
+            match hdd {
+                Ok(hdd) => {
                     // Find an empty slot for the new device
-                    if let Err(e) = poller.as_mut().insert(f(kbd, self.pipe)) {
+                    if let Err(e) = poller.as_mut().insert(hdd.run(self.pipe)) {
                         error!("No empty slots available for new device: {}", e);
                     }
                 }
