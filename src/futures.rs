@@ -86,7 +86,6 @@ impl<Fut1: Future, Fut2: Future> SelectPin2<Fut1, Fut2> {
         Ok(())
     }
 
-
     /// Drops the future in the given slot and marks it as Empty.
     ///
     /// # Safety
@@ -118,8 +117,6 @@ impl<Fut1: Future, Fut2: Future> Future for SelectPin2<Fut1, Fut2> {
     type Output = Either<Fut1::Output, Fut2::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut pending_found = false;
-
         // Poll fut1 if it's occupied
         if self.as_ref().get_ref().states[0] == SlotState::Occupied {
             // Safety: `self` is pinned, state is Occupied.
@@ -136,9 +133,7 @@ impl<Fut1: Future, Fut2: Future> Future for SelectPin2<Fut1, Fut2> {
                     unsafe { self.as_mut().drop_future_at(0) };
                     return Poll::Ready(Either::First(output));
                 }
-                Poll::Pending => {
-                    pending_found = true; // Waker registered by poll.
-                }
+                Poll::Pending => {}
             }
         }
 
@@ -157,9 +152,7 @@ impl<Fut1: Future, Fut2: Future> Future for SelectPin2<Fut1, Fut2> {
                     unsafe { self.as_mut().drop_future_at(1) };
                     return Poll::Ready(Either::Second(output));
                 }
-                Poll::Pending => {
-                    pending_found = true; // Waker registered by poll.
-                }
+                Poll::Pending => {}
             }
         }
 
