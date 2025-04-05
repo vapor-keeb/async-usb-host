@@ -40,7 +40,7 @@ impl HidKbd {
         let mut buf = [0u8; 8]; // Standard HID keyboard report is 8 bytes
 
         let Self {
-            device,
+            device: _, // Mark device as unused for now
             interrupt_channel,
         } = self;
 

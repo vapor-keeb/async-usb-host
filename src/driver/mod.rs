@@ -1,16 +1,12 @@
 /// USB Hub class driver, private because it is only used by the main driver.
 ///
-use core::{
-    future::Future,
-    pin::{pin, Pin},
-    result,
-};
+use core::{future::Future, pin::pin};
 
 use crate::{
     descriptor::DeviceDescriptor,
     driver::kbd::HidKbd,
     errors::UsbHostError,
-    futures::{select_pin_array, StaticUnpinPoller},
+    futures::StaticUnpinPoller,
     pipe::USBHostPipe,
     DeviceHandle, HostDriver,
 };

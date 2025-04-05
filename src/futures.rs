@@ -8,69 +8,192 @@ use core::{
 
 use embassy_futures::select::Either;
 
-/// Future for the [`select_pin2`] function.
+// Forward declaration of SlotState if needed, or ensure it's defined before use.
+// Assuming SlotState is defined later in the file as shown in the context.
+
+/// Future for selecting between two potentially `!Unpin` futures.
+///
+/// Similar to `embassy_futures::select::select`, but owns the futures
+/// and manages their state internally, allowing for `!Unpin` types.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct SelectPin2<'a, 'b, 'c, 'd, Fut1, Fut2> {
-    fut1: &'a mut Pin<&'b mut Option<Fut1>>,
-    fut2: &'c mut Pin<&'d mut Option<Fut2>>,
+pub struct SelectPin2<Fut1: Future, Fut2: Future> {
+    fut1: MaybeUninit<Fut1>,
+    fut2: MaybeUninit<Fut2>,
+    /// 0: fut1 state, 1: fut2 state
+    states: [SlotState; 2],
 }
 
-/// Creates a new future which will select between two pinned optional futures of different types.
-///
-/// The returned future will wait for either future to be ready. Upon
-/// completion the item resolved will be returned, wrapped in an Either enum
-/// indicating which future was ready.
-///
-/// The completed future's Option will be set to None after completion.
-pub fn select_pin2<'a, 'b, 'c, 'd, Fut1: Future, Fut2: Future>(
-    fut1: &'a mut Pin<&'b mut Option<Fut1>>,
-    fut2: &'c mut Pin<&'d mut Option<Fut2>>,
-) -> SelectPin2<'a, 'b, 'c, 'd, Fut1, Fut2> {
-    SelectPin2 { fut1, fut2 }
-}
+impl<Fut1: Future, Fut2: Future> SelectPin2<Fut1, Fut2> {
+    /// Creates a new, empty selector.
+    ///
+    /// Both slots are initially `Empty`. Use `insert_fut1` and `insert_fut2`
+    /// to add futures.
+    pub fn new() -> Self {
+        Self {
+            // Safety: An uninitialized `MaybeUninit<T>` is valid.
+            fut1: MaybeUninit::uninit(),
+            fut2: MaybeUninit::uninit(),
+            states: [SlotState::Empty, SlotState::Empty],
+        }
+    }
 
-impl<'a, 'b, 'c, 'd, Fut1: Future, Fut2: Future> Future for SelectPin2<'a, 'b, 'c, 'd, Fut1, Fut2> {
-    type Output = Either<Fut1::Output, Fut2::Output>;
+    /// Creates a new selector initialized with the two provided futures.
+    pub fn with_futures(fut1: Fut1, fut2: Fut2) -> Self {
+        Self {
+            fut1: MaybeUninit::new(fut1),
+            fut2: MaybeUninit::new(fut2),
+            states: [SlotState::Occupied, SlotState::Occupied],
+        }
+    }
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Safety: Since `self` is pinned, the fields cannot move. Therefore it is safe
-        // to access the fields and pin references to the contained futures.
+    /// Inserts the first future (`Fut1`) into its slot.
+    ///
+    /// Requires `Pin<&mut Self>` to ensure structural integrity if `Fut1` is `!Unpin`.
+    ///
+    /// Returns `Ok(())` on success.
+    /// Returns `Err(PollerError::SlotOccupied)` if slot 0 is not empty.
+    pub fn insert_fut1(self: Pin<&mut Self>, future: Fut1) -> Result<(), PollerError> {
+        // Safety: We don't move fields out of `self`.
         let this = unsafe { self.get_unchecked_mut() };
 
-        // Poll the first future if it exists
-        if let Some(fut1) = unsafe { this.fut1.as_mut().get_unchecked_mut().as_mut() } {
-            match unsafe { Pin::new_unchecked(fut1) }.poll(cx) {
+        if this.states[0] != SlotState::Empty {
+            return Err(PollerError::SlotOccupied);
+        }
+
+        // Write the future into the storage and update the state.
+        this.fut1.write(future);
+        this.states[0] = SlotState::Occupied;
+        Ok(())
+    }
+
+    /// Inserts the second future (`Fut2`) into its slot.
+    ///
+    /// Requires `Pin<&mut Self>` to ensure structural integrity if `Fut2` is `!Unpin`.
+    ///
+    /// Returns `Ok(())` on success.
+    /// Returns `Err(PollerError::SlotOccupied)` if slot 1 is not empty.
+    pub fn insert_fut2(self: Pin<&mut Self>, future: Fut2) -> Result<(), PollerError> {
+        // Safety: We don't move fields out of `self`.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.states[1] != SlotState::Empty {
+            return Err(PollerError::SlotOccupied);
+        }
+
+        // Write the future into the storage and update the state.
+        this.fut2.write(future);
+        this.states[1] = SlotState::Occupied;
+        Ok(())
+    }
+
+
+    /// Drops the future in the given slot and marks it as Empty.
+    ///
+    /// # Safety
+    /// Caller must ensure `self` is pinned and the slot `index` is `Occupied`.
+    #[inline]
+    unsafe fn drop_future_at(self: Pin<&mut Self>, index: usize) {
+        // Safety: We don't move fields out of `self`.
+        let this = self.get_unchecked_mut();
+        debug_assert!(index < 2 && this.states[index] == SlotState::Occupied);
+
+        match index {
+            0 => {
+                // Safety: State is Occupied, storage contains a valid Fut1.
+                let fut_ptr = this.fut1.as_mut_ptr();
+                ptr::drop_in_place(fut_ptr);
+            }
+            1 => {
+                // Safety: State is Occupied, storage contains a valid Fut2.
+                let fut_ptr = this.fut2.as_mut_ptr();
+                ptr::drop_in_place(fut_ptr);
+            }
+            _ => unreachable!(),
+        }
+        this.states[index] = SlotState::Empty;
+    }
+}
+
+impl<Fut1: Future, Fut2: Future> Future for SelectPin2<Fut1, Fut2> {
+    type Output = Either<Fut1::Output, Fut2::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut pending_found = false;
+
+        // Poll fut1 if it's occupied
+        if self.as_ref().get_ref().states[0] == SlotState::Occupied {
+            // Safety: `self` is pinned, state is Occupied.
+            let fut1_pin = unsafe {
+                // We need `self` pinned *during* the unsafe block.
+                let this = self.as_mut().get_unchecked_mut();
+                Pin::new_unchecked(this.fut1.assume_init_mut())
+            };
+            match fut1_pin.poll(cx) {
                 Poll::Ready(output) => {
-                    // Clear the future
-                    *unsafe { this.fut1.as_mut().get_unchecked_mut() } = None;
+                    // Future completed! Drop it in place and mark slot as empty.
+                    // We need `self` pinned to safely drop.
+                    // Safety: Future at index 0 just completed, state is Occupied.
+                    unsafe { self.as_mut().drop_future_at(0) };
                     return Poll::Ready(Either::First(output));
                 }
-                Poll::Pending => {}
+                Poll::Pending => {
+                    pending_found = true; // Waker registered by poll.
+                }
             }
         }
 
-        // Poll the second future if it exists
-        if let Some(fut2) = unsafe { this.fut2.as_mut().get_unchecked_mut().as_mut() } {
-            match unsafe { Pin::new_unchecked(fut2) }.poll(cx) {
+        // Poll fut2 if it's occupied
+        if self.as_ref().get_ref().states[1] == SlotState::Occupied {
+            // Safety: `self` is pinned, state is Occupied.
+            let fut2_pin = unsafe {
+                // We need `self` pinned *during* the unsafe block.
+                let this = self.as_mut().get_unchecked_mut();
+                Pin::new_unchecked(this.fut2.assume_init_mut())
+            };
+            match fut2_pin.poll(cx) {
                 Poll::Ready(output) => {
-                    // Clear the future
-                    *unsafe { this.fut2.as_mut().get_unchecked_mut() } = None;
+                    // Future completed! Drop it in place and mark slot as empty.
+                    // Safety: Future at index 1 just completed, state is Occupied.
+                    unsafe { self.as_mut().drop_future_at(1) };
                     return Poll::Ready(Either::Second(output));
                 }
-                Poll::Pending => {}
+                Poll::Pending => {
+                    pending_found = true; // Waker registered by poll.
+                }
             }
         }
 
+        // If we reached here, either:
+        // - At least one future was polled and returned Pending.
+        // - Both slots were Empty initially.
+        // In either case, the correct action is to return Pending.
+        // The waker logic ensures we'll be polled again if/when something changes.
         Poll::Pending
     }
 }
 
-/// Represents the state of a slot in the poller.
+impl<Fut1: Future, Fut2: Future> Drop for SelectPin2<Fut1, Fut2> {
+    fn drop(&mut self) {
+        // Manually drop any remaining futures.
+        if self.states[0] == SlotState::Occupied {
+            // Safety: State is Occupied, storage contains a valid Fut1.
+            // We are in `drop`, so `self` won't be used again.
+            unsafe { ptr::drop_in_place(self.fut1.as_mut_ptr()) };
+        }
+        if self.states[1] == SlotState::Occupied {
+            // Safety: State is Occupied, storage contains a valid Fut2.
+            unsafe { ptr::drop_in_place(self.fut2.as_mut_ptr()) };
+        }
+        // No need to update state, the object is being destroyed.
+    }
+}
+
+/// Represents the state of a slot in `SelectPin2` or `StaticUnpinPoller`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 enum SlotState {
-    /// The slot is empty and can accept a new future.
+    /// The slot is empty (future has completed or was never there).
     Empty,
     /// The slot holds an active future being polled.
     Occupied,
