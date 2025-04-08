@@ -28,23 +28,42 @@ pub trait USBHostDeviceDriver: Sized {
     ) -> Result<(), UsbHostError>;
 }
 
-pub struct USBDeviceDispatcher<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize> {
+pub struct USBDeviceDispatcher<
+    'a,
+    HDD: USBHostDeviceDriver,
+    HD: HostDriver,
+    const NR_DEVICES: usize,
+> {
     pipe: &'a USBHostPipe<HD, NR_DEVICES>,
-    new_dev: &'a DeviceChannel,
+    new_dev: DeviceChannel,
     _phantom: PhantomData<HDD>,
 }
 
-impl<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize> USBDeviceDispatcher<'a, HDD, HD, NR_DEVICES> {
-    pub fn new(pipe: &'a USBHostPipe<HD, NR_DEVICES>, new_dev: &'a DeviceChannel) -> Self {
-        Self { pipe, new_dev, _phantom: PhantomData }
+impl<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize>
+    USBDeviceDispatcher<'a, HDD, HD, NR_DEVICES>
+{
+    pub fn new(pipe: &'a USBHostPipe<HD, NR_DEVICES>) -> Self {
+        Self {
+            pipe,
+            new_dev: DeviceChannel::new(),
+            _phantom: PhantomData,
+        }
     }
 
-    pub async fn run(&mut self) {
+    pub fn run<'b>(&'b self) -> impl Future<Output = ()> + use<'a, 'b, HDD, HD, NR_DEVICES> {
+        Self::run_inner(self.pipe, &self.new_dev)
+    }
+
+    pub async fn insert_new_device(&self, device: DeviceHandle, descriptor: DeviceDescriptor) {
+        self.new_dev.send((device, descriptor)).await;
+    }
+
+    async fn run_inner<'b>(pipe: &'a USBHostPipe<HD, NR_DEVICES>, new_dev: &'b DeviceChannel) {
         let poller = StaticUnpinPoller::<_, NR_DEVICES>::new();
         let mut poller = pin!(poller);
 
         loop {
-            let new_dev_fut = self.new_dev.receive();
+            let new_dev_fut = new_dev.receive();
             let (device, descriptor) = if poller.as_mut().is_empty() {
                 new_dev_fut.await
             } else {
@@ -64,11 +83,11 @@ impl<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize> USBD
                     }
                 }
             };
-            let hdd = HDD::try_attach(self.pipe, device, descriptor).await;
+            let hdd = HDD::try_attach(pipe, device, descriptor).await;
             match hdd {
                 Ok(hdd) => {
                     // Find an empty slot for the new device
-                    if let Err(e) = poller.as_mut().insert(hdd.run(self.pipe)) {
+                    if let Err(e) = poller.as_mut().insert(hdd.run(pipe)) {
                         error!("No empty slots available for new device: {}", e);
                     }
                 }
