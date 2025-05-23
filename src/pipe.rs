@@ -57,9 +57,8 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
         tog: DataTog,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError> {
-        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let mut data_in_with_retry = async || loop {
-            match self.pipe.data_in(endpoint, tog, buf).await {
+        loop {
+            match self.data_in(endpoint, tog, buf).await {
                 Ok(size) => return Ok(size),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -68,11 +67,6 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                     return Err(e);
                 }
             }
-        };
-        let data_in_fut = data_in_with_retry();
-        match select(timeout_fut, data_in_fut).await {
-            Either::First(_) => Err(UsbHostError::TransferTimeout),
-            Either::Second(r) => r,
         }
     }
 
@@ -96,9 +90,8 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
         tog: DataTog,
         buf: &[u8],
     ) -> Result<(), UsbHostError> {
-        let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let mut data_out_with_retry = async || loop {
-            match self.pipe.data_out(endpoint, tog, buf).await {
+        loop {
+            match self.data_out(endpoint, tog, buf).await {
                 Ok(()) => return Ok(()),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -107,11 +100,6 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                     return Err(e);
                 }
             }
-        };
-        let data_out_fut = data_out_with_retry();
-        match select(timeout_fut, data_out_fut).await {
-            Either::First(_) => Err(UsbHostError::TransferTimeout),
-            Either::Second(r) => r,
         }
     }
 
