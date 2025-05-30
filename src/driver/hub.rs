@@ -8,7 +8,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::{DataTog, DevInfo, InterruptChannel},
+    types::{DataTog, DevInfo, InterruptChannel, UsbSpeed},
     DeviceHandle, HostDriver,
 };
 
@@ -282,6 +282,7 @@ impl Hub {
                         return Ok(Some(HubEvent::DeviceDetach(DevInfo::new(
                             self.handle.address(),
                             port as u8,
+                            UsbSpeed::LowSpeed,
                         ))));
                     }
                 }
@@ -301,6 +302,7 @@ impl Hub {
                         return Ok(Some(HubEvent::DeviceAttach(DevInfo::new(
                             self.handle.address(),
                             port as u8,
+                            status.speed(),
                         ))));
                     } else {
                         error!("port {} reset changed but set to true", port);

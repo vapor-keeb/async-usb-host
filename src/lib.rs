@@ -230,8 +230,9 @@ impl<'a, D: HostDriver, const NR_HUBS: usize, const NR_DEVICES: usize>
                     trace!("device reset, enumeration begin");
                     Ok(Some(HostInternalEvent::EnumerationBegin))
                 }
-                driver::hub::HubEvent::DeviceAttach(hubinfo) => {
-                    match Self::enumerate_device(pipe, bus, hubs, hubinfo).await? {
+                driver::hub::HubEvent::DeviceAttach(devinfo) => {
+                    trace!("Device attached: {:?}", devinfo);
+                    match Self::enumerate_device(pipe, bus, hubs, devinfo).await? {
                         Some((desc, handle)) => {
                             Ok(Some(HostInternalEvent::HostEvent(HostEvent::NewDevice {
                                 descriptor: desc,
@@ -276,7 +277,10 @@ impl<'a, D: HostDriver, const NR_HUBS: usize, const NR_DEVICES: usize>
 
     async fn enumerate_root(&mut self) -> Option<HostEvent> {
         let mut hubs = ArrayVec::new();
-        match Self::enumerate_device(&self.pipe, &mut self.bus, &mut hubs, DevInfo::root_device())
+        //TODO: fix this unwrap
+        let speed = unwrap!(self.bus.speed().await);
+        trace!("Root device speed: {:?}", speed);
+        match Self::enumerate_device(&self.pipe, &mut self.bus, &mut hubs, DevInfo::root_device(speed))
             .await
         {
             Ok(event) => {

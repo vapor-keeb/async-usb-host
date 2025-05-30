@@ -99,6 +99,21 @@ impl TryFrom<u8> for Pid {
     }
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UsbSpeed {
+    LowSpeed,
+    FullSpeed,
+    HighSpeed,
+}
+
+impl UsbSpeed {
+    pub fn is_classic(&self) -> bool {
+        matches!(self, UsbSpeed::LowSpeed | UsbSpeed::FullSpeed)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
@@ -162,35 +177,48 @@ impl DataTog {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 pub struct DevInfo {
     /// 7-bit USB address and the highest bit being a "valid" flag
     valid_parent_addr: u8,
     port_on_parent: u8,
+    speed: UsbSpeed,
 }
+
+impl PartialEq for DevInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.valid_parent_addr == other.valid_parent_addr
+            && self.port_on_parent == other.port_on_parent
+    }
+}
+
+impl Eq for DevInfo {}
 
 impl DevInfo {
     pub fn empty() -> Self {
         DevInfo {
             valid_parent_addr: 0,
             port_on_parent: 0,
+            speed: UsbSpeed::LowSpeed,
         }
     }
 
-    pub fn root_device() -> Self {
+    pub fn root_device(speed: UsbSpeed) -> Self {
         DevInfo {
             valid_parent_addr: 0x80,
             port_on_parent: 0,
+            speed,
         }
     }
 
-    pub fn new(addr: u8, port: u8) -> Self {
+    pub fn new(addr: u8, port: u8, speed: UsbSpeed) -> Self {
         assert!((addr & 0x7F) != 0);
         DevInfo {
             valid_parent_addr: 0x80 | addr,
             port_on_parent: port,
+            speed,
         }
     }
 

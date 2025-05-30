@@ -1,3 +1,5 @@
+use crate::types::UsbSpeed;
+
 #[cfg_attr(target_endian = "little", repr(C, packed))]
 #[derive(Default, Clone)]
 pub struct HubDescriptor {
@@ -68,6 +70,15 @@ impl HubPortStatus {
         self.0 & 0x400 != 0
     }
 
+    pub fn speed(&self) -> UsbSpeed {
+        if self.high_speed() {
+            UsbSpeed::HighSpeed
+        } else if self.low_speed() {
+            UsbSpeed::LowSpeed
+        } else {
+            UsbSpeed::FullSpeed
+        }
+    }
     pub fn test_mode(&self) -> bool {
         self.0 & 0x800 != 0
     }

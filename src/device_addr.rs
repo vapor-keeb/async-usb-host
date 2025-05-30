@@ -104,6 +104,7 @@ impl<const NR_DEVICES: usize> DeviceAddressManager<NR_DEVICES> {
         mask
     }
 
+    // TODO: fix the amazing union-find to not take a DevInfo
     fn find_index(&self, dev_info: DevInfo) -> Option<usize> {
         for i in 0..NR_DEVICES {
             if self.info[i] == dev_info {

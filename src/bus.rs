@@ -1,4 +1,4 @@
-use crate::HostDriver;
+use crate::{types::UsbSpeed, HostDriver};
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Event {
@@ -13,6 +13,7 @@ pub enum Event {
 pub trait Bus {
     async fn reset(&mut self);
     async fn poll(&mut self) -> Event;
+    async fn speed(&mut self) -> Option<UsbSpeed>;
 }
 
 pub(crate) struct BusWrap<D: HostDriver>(D::Bus);
@@ -22,10 +23,15 @@ impl<D: HostDriver> BusWrap<D> {
         Self(bus)
     }
 
+    pub async fn speed(&mut self) -> Option<UsbSpeed> {
+        self.0.speed().await
+    }
+
     pub async fn poll(&mut self) -> Event {
         match self.0.poll().await {
             Event::DeviceAttach => {
                 self.0.reset().await;
+                //TODO: why this wait????
                 embassy_time::Timer::after_millis(500).await;
 
                 Event::DeviceAttach

@@ -20,6 +20,10 @@ pub trait Pipe {
     /// When setup is called, it should send a setup request, also setup the
     /// hardware to send / expect DATA1 packets on subsequent data_in / data_out
     async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError>;
+
+    // TODO: fix ep_type to a proper type
+    async fn ssplit(&mut self, port: u8, ep_type: u8) -> Result<(), UsbHostError>;
+
     async fn data_in(
         &mut self,
         endpoint: u8,
