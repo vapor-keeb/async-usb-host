@@ -177,48 +177,28 @@ impl DataTog {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
-pub struct DevInfo {
+pub struct PortInfo {
     /// 7-bit USB address and the highest bit being a "valid" flag
     valid_parent_addr: u8,
     port_on_parent: u8,
-    speed: UsbSpeed,
 }
 
-impl PartialEq for DevInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.valid_parent_addr == other.valid_parent_addr
-            && self.port_on_parent == other.port_on_parent
-    }
-}
-
-impl Eq for DevInfo {}
-
-impl DevInfo {
-    pub fn empty() -> Self {
-        DevInfo {
+impl PortInfo {
+    pub fn invalid() -> Self {
+        PortInfo {
             valid_parent_addr: 0,
             port_on_parent: 0,
-            speed: UsbSpeed::LowSpeed,
         }
     }
 
-    pub fn root_device(speed: UsbSpeed) -> Self {
-        DevInfo {
-            valid_parent_addr: 0x80,
-            port_on_parent: 0,
-            speed,
-        }
-    }
-
-    pub fn new(addr: u8, port: u8, speed: UsbSpeed) -> Self {
-        assert!((addr & 0x7F) != 0);
-        DevInfo {
-            valid_parent_addr: 0x80 | addr,
-            port_on_parent: port,
-            speed,
+    // hub constructs PortInfo on detach
+    pub(crate) fn new(valid_parent_addr: u8, port_on_parent: u8) -> Self {
+        PortInfo {
+            valid_parent_addr,
+            port_on_parent,
         }
     }
 
@@ -236,5 +216,60 @@ impl DevInfo {
 
     pub fn port(&self) -> u8 {
         self.port_on_parent
+    }
+}
+
+#[derive(Copy, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(not(feature = "defmt"), derive(Debug))]
+pub struct DevInfo {
+    port: PortInfo,
+    // tt addr, port
+    // TODO: clean up
+    transaction_translator: Option<(u8, u8)>,
+    speed: UsbSpeed,
+}
+
+impl DevInfo {
+    pub fn empty() -> Self {
+        DevInfo {
+            port: PortInfo::invalid(),
+            transaction_translator: None,
+            speed: UsbSpeed::LowSpeed,
+        }
+    }
+
+    pub fn root_device(speed: UsbSpeed) -> Self {
+        DevInfo {
+            port: PortInfo::new(0x80, 0),
+            transaction_translator: None,
+            speed,
+        }
+    }
+
+    pub fn new(
+        addr: u8,
+        port: u8,
+        transaction_translator: Option<(u8, u8)>,
+        speed: UsbSpeed,
+    ) -> Self {
+        assert!((addr & 0x7F) != 0);
+        DevInfo {
+            port: PortInfo::new(0x80 | addr, port),
+            transaction_translator,
+            speed,
+        }
+    }
+
+    pub fn port(&self) -> PortInfo {
+        self.port
+    }
+
+    pub fn transaction_translator(&self) -> Option<(u8, u8)> {
+        self.transaction_translator
+    }
+
+    pub fn speed(&self) -> UsbSpeed {
+        self.speed
     }
 }

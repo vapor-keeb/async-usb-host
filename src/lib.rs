@@ -242,9 +242,9 @@ impl<'a, D: HostDriver, const NR_HUBS: usize, const NR_DEVICES: usize>
                         None => Ok(Some(HostInternalEvent::EnumerationEnd)),
                     }
                 }
-                driver::hub::HubEvent::DeviceDetach(hubinfo) => {
-                    trace!("device detached {}", hubinfo);
-                    let mut mask = pipe.dev_detach(hubinfo).await;
+                driver::hub::HubEvent::DeviceDetach(portinfo) => {
+                    trace!("device detached {}", portinfo);
+                    let mut mask = pipe.dev_detach(portinfo).await;
                     Self::remove_disconnected_hubs(hubs, &mut mask);
                     Ok(Some(HostInternalEvent::HostEvent(
                         HostEvent::DeviceDetach { mask },

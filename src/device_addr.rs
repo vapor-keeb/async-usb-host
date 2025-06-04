@@ -1,6 +1,6 @@
 use bitvec::{array::BitArray, BitArr};
 
-use crate::types::DevInfo;
+use crate::types::{DevInfo, PortInfo};
 
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -8,6 +8,7 @@ use crate::types::DevInfo;
 pub struct DeviceHandle {
     address: u8,
     max_packet_size: u16,
+    //TODO: this is not a parent any more
     parent: DevInfo,
 }
 
@@ -18,6 +19,10 @@ impl DeviceHandle {
 
     pub fn max_packet_size(&self) -> u16 {
         self.max_packet_size
+    }
+
+    pub(crate) fn dev_info(&self) -> DevInfo {
+        self.parent
     }
 }
 
@@ -62,22 +67,22 @@ impl DeviceDisconnectMask {
 
 pub(crate) struct DeviceAddressManager<const NR_DEVICES: usize> {
     // 1-based indexing
-    info: [DevInfo; NR_DEVICES],
+    info: [PortInfo; NR_DEVICES],
 }
 
 impl<const NR_DEVICES: usize> DeviceAddressManager<NR_DEVICES> {
     // Construct an allocator with all addresses except 0 occupied.
     pub fn new() -> Self {
         Self {
-            info: [DevInfo::empty(); NR_DEVICES],
+            info: [PortInfo::invalid(); NR_DEVICES],
         }
     }
 
     pub fn alloc_device_address(&mut self, max_packet_size: u16, parent: DevInfo) -> DeviceHandle {
-        debug_assert!(!parent.is_empty());
+        debug_assert!(!parent.port().is_empty());
         for i in 0..NR_DEVICES {
             if self.info[i].is_empty() {
-                self.info[i] = parent;
+                self.info[i] = parent.port();
                 return DeviceHandle {
                     address: i as u8 + 1,
                     max_packet_size,
@@ -90,7 +95,7 @@ impl<const NR_DEVICES: usize> DeviceAddressManager<NR_DEVICES> {
 
     pub fn free_address(&mut self, device_handle: DeviceHandle) {
         debug_assert!(!self.info[device_handle.address as usize - 1].is_empty());
-        self.info[device_handle.address as usize - 1] = DevInfo::empty();
+        self.info[device_handle.address as usize - 1] = PortInfo::invalid();
     }
 
     pub fn free_all_addresses(&mut self) -> DeviceDisconnectMask {
@@ -98,14 +103,14 @@ impl<const NR_DEVICES: usize> DeviceAddressManager<NR_DEVICES> {
         for i in 0..NR_DEVICES {
             if !self.info[i].is_empty() {
                 mask.mask.set(i + 1, true);
-                self.info[i] = DevInfo::empty();
+                self.info[i] = PortInfo::invalid();
             }
         }
         mask
     }
 
     // TODO: fix the amazing union-find to not take a DevInfo
-    fn find_index(&self, dev_info: DevInfo) -> Option<usize> {
+    fn find_index(&self, dev_info: PortInfo) -> Option<usize> {
         for i in 0..NR_DEVICES {
             if self.info[i] == dev_info {
                 return Some(i);
@@ -114,13 +119,13 @@ impl<const NR_DEVICES: usize> DeviceAddressManager<NR_DEVICES> {
         None
     }
 
-    pub fn free_subtree(&mut self, dev_info: DevInfo) -> DeviceDisconnectMask {
+    pub fn free_subtree(&mut self, dev_info: PortInfo) -> DeviceDisconnectMask {
         let mut mask = DeviceDisconnectMask::new();
         let idx = self.find_index(dev_info);
 
         if let Some(idx) = idx {
             debug_assert!(!self.info[idx].is_empty());
-            self.info[idx] = DevInfo::empty();
+            self.info[idx] = PortInfo::invalid();
             mask.mask.set(idx + 1, true);
         } else {
             warn!("freeing non-existent device {}", dev_info);
@@ -193,7 +198,7 @@ impl<const NR_DEVICES: usize> DeviceAddressManager<NR_DEVICES> {
                         i + 1
                     );
                     mask.mask.set(i + 1, true);
-                    self.info[i] = DevInfo::empty();
+                    self.info[i] = PortInfo::invalid();
                 }
             }
         }

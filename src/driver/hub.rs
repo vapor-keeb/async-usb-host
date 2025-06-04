@@ -8,7 +8,7 @@ use crate::{
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
-    types::{DataTog, DevInfo, InterruptChannel, UsbSpeed},
+    types::{DataTog, DevInfo, InterruptChannel, PortInfo, UsbSpeed},
     DeviceHandle, HostDriver,
 };
 
@@ -22,7 +22,7 @@ pub(crate) struct Hub {
 pub(crate) enum HubEvent {
     DeviceReset,
     DeviceAttach(DevInfo),
-    DeviceDetach(DevInfo),
+    DeviceDetach(PortInfo),
 }
 
 impl Hub {
@@ -250,7 +250,6 @@ impl Hub {
         bitmask: &PortChangeBitmask,
         enumeration_in_progress: bool,
     ) -> Result<Option<HubEvent>, UsbHostError> {
-        // TODO: left off here
         // Poll port status
         for port in bitmask.iter_ones() {
             if port == 0 {
@@ -279,10 +278,9 @@ impl Hub {
                     } else {
                         self.clear_port_feature(pipe, port as u8, HubPortFeature::ChangeConnection)
                             .await?;
-                        return Ok(Some(HubEvent::DeviceDetach(DevInfo::new(
+                        return Ok(Some(HubEvent::DeviceDetach(PortInfo::new(
                             self.handle.address(),
                             port as u8,
-                            UsbSpeed::LowSpeed,
                         ))));
                     }
                 }
@@ -299,9 +297,20 @@ impl Hub {
                             .await
                     );
                     if !status.reset() {
+                        let tt = match (self.handle.dev_info().speed(), status.speed()) {
+                            (UsbSpeed::HighSpeed, UsbSpeed::FullSpeed | UsbSpeed::LowSpeed) => {
+                                // Hub is the TT for this device
+                                Some((self.handle.address(), port as u8))
+                            }
+                            (_, _) => {
+                                // device has the same TT as the hub.
+                                self.handle.dev_info().transaction_translator()
+                            }
+                        };
                         return Ok(Some(HubEvent::DeviceAttach(DevInfo::new(
                             self.handle.address(),
                             port as u8,
+                            tt,
                             status.speed(),
                         ))));
                     } else {

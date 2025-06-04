@@ -6,6 +6,7 @@ pub enum UsbHostError {
     Unknown,
     // USB Device packet level errors
     NAK,
+    NYET, // Used for split transactions
     WrongTog,
     STALL,
     UnexpectedPID,

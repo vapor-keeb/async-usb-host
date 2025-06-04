@@ -9,7 +9,7 @@ use crate::{
     device_addr::DeviceDisconnectMask,
     errors::UsbHostError,
     request::{self, Request, StandardDeviceRequest},
-    types::{self, DataTog, DevInfo, InterruptChannel},
+    types::{self, DataTog, DevInfo, InterruptChannel, PortInfo},
     DeviceAddressManager, DeviceHandle, HostDriver, TRANSFER_TIMEOUT,
 };
 
@@ -19,10 +19,15 @@ pub trait Pipe {
     fn set_addr(&mut self, addr: u8);
     /// When setup is called, it should send a setup request, also setup the
     /// hardware to send / expect DATA1 packets on subsequent data_in / data_out
-    async fn setup(&mut self, buf: &[u8; 8]) -> Result<(), UsbHostError>;
+    async fn setup(&mut self, buf: &[u8]) -> Result<(), UsbHostError>;
 
     // TODO: fix ep_type to a proper type
-    async fn ssplit(&mut self, port: u8, ep_type: u8) -> Result<(), UsbHostError>;
+    // msb: lsb
+    // 00 control
+    // 01 isochronous
+    // 10 bulk
+    // 11 interrupt
+    async fn split(&mut self, complete: bool, port: u8, ep_type: u8) -> Result<(), UsbHostError>;
 
     async fn data_in(
         &mut self,
@@ -43,12 +48,75 @@ struct USBHostPipeInner<D: HostDriver, const NR_DEVICES: usize> {
     address_alloc: DeviceAddressManager<NR_DEVICES>,
 }
 
+/// wrapper around the underlying pipe implementation with support for split transactions
 impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
-    async fn setup(&mut self, req: &Request) -> Result<(), UsbHostError> {
+    async fn split_setup(
+        &mut self,
+        tt_addr: u8,
+        tt_port: u8,
+        address: u8,
+        req: &Request,
+    ) -> Result<(), UsbHostError> {
+        loop {
+            self.pipe.set_addr(tt_addr);
+            self.pipe
+                .split(false, tt_port, /* control ep type */ 0x00)
+                .await?;
+            let setup_fut = self.pipe.setup(unsafe {
+                core::slice::from_raw_parts(
+                    core::mem::transmute::<&Request, *const u8>(req),
+                    core::mem::size_of::<Request>(),
+                )
+            });
+            match setup_fut.await {
+                Ok(()) => break,
+                Err(UsbHostError::NAK) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        loop {
+            self.pipe.set_addr(tt_addr);
+            self.pipe
+                .split(true, tt_port, /* control ep type */ 0x00)
+                .await?;
+            let setup_fut = self.pipe.setup(&[]);
+            match setup_fut.await {
+                Ok(()) => break,
+                Err(UsbHostError::NYET) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn setup(
+        &mut self,
+        dev_info: &DevInfo,
+        address: u8,
+        req: &Request,
+    ) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
         #[cfg(not(target_endian = "little"))]
         compile_error!("Only little endian supported");
-        let setup_fut = self.pipe.setup(unsafe { transmute(req) });
+        if let Some((tt_addr, tt_port)) = dev_info.transaction_translator() {
+            return self.split_setup(tt_addr, tt_port, address, req).await;
+        }
+        self.pipe.set_addr(address);
+        let setup_fut = self.pipe.setup(unsafe {
+            core::slice::from_raw_parts(
+                core::mem::transmute::<&Request, *const u8>(req),
+                core::mem::size_of::<Request>(),
+            )
+        });
         match select(timeout_fut, setup_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
@@ -139,6 +207,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
     pub async fn assign_device_address(
         &self,
         max_packet_size: u16,
+        //TODO: take reference
         parent: DevInfo,
     ) -> Result<DeviceHandle, UsbHostError> {
         let mut inner = self.inner.lock().await;
@@ -162,7 +231,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             };
 
             // Setup stage
-            inner.setup(&request).await?;
+            inner.setup(&parent, 0, &request).await?;
             // Status stage (no data)
             inner.data_in_with_retry(0, DataTog::DATA1, &mut []).await?;
 
@@ -179,6 +248,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
 
     async fn get_device_descriptor<'b>(
         &self,
+        dev_info: &DevInfo,
         buf: &'b mut [u8],
     ) -> Result<&'b DeviceDescriptor, UsbHostError> {
         debug_assert!(buf.len() >= 18);
@@ -199,8 +269,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             length: 64,
         };
         // default address upon initial connection
-        inner.pipe.set_addr(0);
-        inner.setup(&request).await?;
+        inner.setup(dev_info, 0, &request).await?;
         trace!("setup finished");
 
         let mut tog = DataTog::DATA1;
@@ -273,10 +342,10 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
 
         debug_assert!(buffer.len() >= request.length as usize);
 
-        inner.pipe.set_addr(device_handle.address());
-
         // Setup stage
-        inner.setup(request).await?;
+        inner
+            .setup(&device_handle.dev_info(), device_handle.address(), request)
+            .await?;
 
         // (Optional) data stage
         if request.length > 0 {
@@ -313,15 +382,15 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
 
     pub async fn dev_attach(
         &self,
-        parent: DevInfo,
+        dev_info: DevInfo,
     ) -> Result<(DeviceDescriptor, DeviceHandle), UsbHostError> {
         let mut buffer: [u8; 18] = [0u8; 18];
-        let d = self.get_device_descriptor(&mut buffer).await?;
+        let d = self.get_device_descriptor(&dev_info, &mut buffer).await?;
         let max_packet_size = d.max_packet_size;
         trace!("DeviceDescriptor: {}", d);
 
         let handle = self
-            .assign_device_address(max_packet_size as u16, parent)
+            .assign_device_address(max_packet_size as u16, dev_info)
             .await?;
         trace!("Device addressed {}", handle.address());
 
@@ -333,8 +402,8 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         inner.address_alloc.free_all_addresses()
     }
 
-    pub async fn dev_detach(&self, dev_info: DevInfo) -> DeviceDisconnectMask {
+    pub async fn dev_detach(&self, port_info: PortInfo) -> DeviceDisconnectMask {
         let mut inner = self.inner.lock().await;
-        inner.address_alloc.free_subtree(dev_info)
+        inner.address_alloc.free_subtree(port_info)
     }
 }
