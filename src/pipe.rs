@@ -62,6 +62,8 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
             self.pipe
                 .split(false, tt_port, /* control ep type */ 0x00)
                 .await?;
+
+            self.pipe.set_addr(address);
             let setup_fut = self.pipe.setup(Some(unsafe {
                 core::mem::transmute::<&Request, &[u8; 8]>(req)
             }));
@@ -81,6 +83,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
             self.pipe
                 .split(true, tt_port, /* control ep type */ 0x00)
                 .await?;
+            self.pipe.set_addr(address);
             let setup_fut = self.pipe.setup(None);
             match setup_fut.await {
                 Ok(()) => break,
