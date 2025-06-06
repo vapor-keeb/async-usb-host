@@ -39,7 +39,7 @@ pub trait Pipe {
         &mut self,
         endpoint: u8,
         tog: DataTog,
-        buf: &[u8],
+        buf: Option<&[u8]>,
     ) -> Result<(), UsbHostError>;
 }
 
@@ -86,7 +86,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
             self.pipe.set_addr(address);
             let setup_fut = self.pipe.setup(None);
             match setup_fut.await {
-                Ok(()) => break,
+                Ok(()) => return Ok(()),
                 Err(UsbHostError::NYET) => {
                     continue;
                 }
@@ -95,7 +95,6 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                 }
             }
         }
-        Ok(())
     }
 
     async fn setup(
@@ -122,12 +121,14 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
 
     async fn data_in_with_retry(
         &mut self,
+        dev_info: &DevInfo,
+        address: u8,
         endpoint: u8,
         tog: DataTog,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError> {
         loop {
-            match self.data_in(endpoint, tog, buf).await {
+            match self.data_in(dev_info, address, endpoint, tog, buf).await {
                 Ok(size) => return Ok(size),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -139,28 +140,91 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
         }
     }
 
+    async fn split_data_in(
+        &mut self,
+        tt_addr: u8,
+        tt_port: u8,
+        address: u8,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &mut [u8],
+    ) -> Result<usize, UsbHostError> {
+        loop {
+            self.pipe.set_addr(tt_addr);
+            // TODO: this is a huge problem, fix
+            self.pipe
+                .split(false, tt_port, /* control ep type */ 0x00)
+                .await?;
+            self.pipe.set_addr(address);
+            let in_fut = self.pipe.data_in(endpoint, tog, &mut []);
+
+            match in_fut.await {
+                Ok(_) => {
+                    break;
+                }
+                Err(UsbHostError::NAK) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        // Do the csplit, retry on NYET
+        loop {
+            self.pipe.set_addr(tt_addr);
+            self.pipe
+                .split(true, tt_port, /* control ep type */ 0x00)
+                .await?;
+            self.pipe.set_addr(address);
+            let in_fut = self.pipe.data_in(endpoint, tog, buf);
+            match in_fut.await {
+                Ok(size) => return Ok(size),
+                Err(UsbHostError::NYET) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     async fn data_in(
         &mut self,
+        dev_info: &DevInfo,
+        address: u8,
         endpoint: u8,
         tog: DataTog,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let data_fut = self.pipe.data_in(endpoint, tog, buf);
-        match select(timeout_fut, data_fut).await {
-            Either::First(_) => Err(UsbHostError::TransferTimeout),
-            Either::Second(r) => r,
+        if let Some((tt_addr, tt_port)) = dev_info.transaction_translator() {
+            let fut = self.split_data_in(tt_addr, tt_port, address, endpoint, tog, buf);
+            match select(timeout_fut, fut).await {
+                Either::First(_) => Err(UsbHostError::TransferTimeout),
+                Either::Second(r) => r,
+            }
+        } else {
+            let fut = self.pipe.data_in(endpoint, tog, buf);
+            match select(timeout_fut, fut).await {
+                Either::First(_) => Err(UsbHostError::TransferTimeout),
+                Either::Second(r) => r,
+            }
         }
     }
 
     async fn data_out_with_retry(
         &mut self,
+        dev_info: &DevInfo,
+        address: u8,
         endpoint: u8,
         tog: DataTog,
         buf: &[u8],
     ) -> Result<(), UsbHostError> {
         loop {
-            match self.data_out(endpoint, tog, buf).await {
+            match self.data_out(dev_info, address, endpoint, tog, buf).await {
                 Ok(()) => return Ok(()),
                 Err(UsbHostError::NAK) => {
                     continue;
@@ -172,17 +236,78 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
         }
     }
 
+    async fn split_data_out(
+        &mut self,
+        tt_addr: u8,
+        tt_port: u8,
+        address: u8,
+        endpoint: u8,
+        tog: DataTog,
+        buf: &[u8],
+    ) -> Result<(), UsbHostError> {
+        loop {
+            self.pipe.set_addr(tt_addr);
+            // TODO: this is a huge problem, fix
+            self.pipe
+                .split(false, tt_port, /* control ep type */ 0x00)
+                .await?;
+            self.pipe.set_addr(address);
+            let in_fut = self.pipe.data_out(endpoint, tog, Some(buf));
+
+            match in_fut.await {
+                Ok(_) => {
+                    break;
+                }
+                Err(UsbHostError::NAK) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        // Do the csplit, retry on NYET
+        loop {
+            self.pipe.set_addr(tt_addr);
+            self.pipe
+                .split(true, tt_port, /* control ep type */ 0x00)
+                .await?;
+            self.pipe.set_addr(address);
+            let in_fut = self.pipe.data_out(endpoint, tog, None);
+            match in_fut.await {
+                Ok(size) => return Ok(size),
+                Err(UsbHostError::NYET) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     async fn data_out(
         &mut self,
+        dev_info: &DevInfo,
+        address: u8,
         endpoint: u8,
         tog: DataTog,
         buf: &[u8],
     ) -> Result<(), UsbHostError> {
         let timeout_fut = Timer::after(TRANSFER_TIMEOUT);
-        let data_fut = self.pipe.data_out(endpoint, tog, buf);
-        match select(timeout_fut, data_fut).await {
-            Either::First(_) => Err(UsbHostError::TransferTimeout),
-            Either::Second(r) => r,
+        if let Some((tt_addr, tt_port)) = dev_info.transaction_translator() {
+            let fut = self.split_data_out(tt_addr, tt_port, address, endpoint, tog, buf);
+            match select(timeout_fut, fut).await {
+                Either::First(_) => Err(UsbHostError::TransferTimeout),
+                Either::Second(r) => r,
+            }
+        } else {
+            let fut = self.pipe.data_out(endpoint, tog, Some(buf));
+            match select(timeout_fut, fut).await {
+                Either::First(_) => Err(UsbHostError::TransferTimeout),
+                Either::Second(r) => r,
+            }
         }
     }
 }
@@ -205,12 +330,12 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         &self,
         max_packet_size: u16,
         //TODO: take reference
-        parent: DevInfo,
+        devinfo: DevInfo,
     ) -> Result<DeviceHandle, UsbHostError> {
         let mut inner = self.inner.lock().await;
         let handle = inner
             .address_alloc
-            .alloc_device_address(max_packet_size, parent);
+            .alloc_device_address(max_packet_size, devinfo);
 
         if let Err(e) = (async || {
             let request = Request {
@@ -228,9 +353,11 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             };
 
             // Setup stage
-            inner.setup(&parent, 0, &request).await?;
+            inner.setup(&devinfo, 0, &request).await?;
             // Status stage (no data)
-            inner.data_in_with_retry(0, DataTog::DATA1, &mut []).await?;
+            inner
+                .data_in_with_retry(&devinfo, 0, 0, DataTog::DATA1, &mut [])
+                .await?;
 
             Ok(())
         })()
@@ -243,6 +370,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         Ok(handle)
     }
 
+    // TODO: maybe take a address, technically we can do this after enumeration
     async fn get_device_descriptor<'b>(
         &self,
         dev_info: &DevInfo,
@@ -272,7 +400,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         let mut tog = DataTog::DATA1;
         // Data stage
         let mut bytes_read = 0usize;
-        let in_result = inner.data_in_with_retry(0, tog, buf).await?;
+        let in_result = inner.data_in_with_retry(dev_info, 0, 0, tog, buf).await?;
         tog.next();
         bytes_read += in_result;
 
@@ -284,7 +412,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             // is safe because there are no other outstanding immutable borrows of
             // the memory region being modified.
             let in_result = inner
-                .data_in_with_retry(0, tog, unsafe {
+                .data_in_with_retry(dev_info, 0, 0, tog, unsafe {
                     core::slice::from_raw_parts_mut(
                         chopped_off_buf.as_ptr() as *mut u8,
                         chopped_off_buf.len(),
@@ -296,7 +424,9 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         }
 
         // Status stage
-        inner.data_out_with_retry(0, DataTog::DATA1, &[]).await?;
+        inner
+            .data_out_with_retry(dev_info, 0, 0, DataTog::DATA1, &[])
+            .await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
         let dev_desc = parse_descriptor(buf)
@@ -319,8 +449,27 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             .set_addr(interrupt_channel.device_handle.address());
 
         let res = match interrupt_channel.endpoint_address.direction {
-            types::EndpointDirection::In => inner.data_in(endpoint, tog, buf).await,
-            types::EndpointDirection::Out => inner.data_out(endpoint, tog, buf).await.map(|_| 0),
+            types::EndpointDirection::In => {
+                inner
+                    .data_in(
+                        &interrupt_channel.device_handle.dev_info(),
+                        interrupt_channel.device_handle.address(),
+                        endpoint,
+                        tog,
+                        buf,
+                    )
+                    .await
+            }
+            types::EndpointDirection::Out => inner
+                .data_out(
+                    &interrupt_channel.device_handle.dev_info(),
+                    interrupt_channel.device_handle.address(),
+                    endpoint,
+                    tog,
+                    buf,
+                )
+                .await
+                .map(|_| 0),
         }?;
         interrupt_channel.tog.next();
         Ok(res)
@@ -352,7 +501,13 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
                     let mut tog = DataTog::DATA1;
                     loop {
                         let len = inner
-                            .data_in_with_retry(0, tog, &mut buffer[bytes_received..])
+                            .data_in_with_retry(
+                                &device_handle.dev_info(),
+                                device_handle.address(),
+                                0,
+                                tog,
+                                &mut buffer[bytes_received..],
+                            )
                             .await?;
                         tog.next();
                         bytes_received += len;
@@ -367,10 +522,26 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         // Status stage
         match dir {
             RequestTypeDirection::HostToDevice => {
-                inner.data_in_with_retry(0, DataTog::DATA1, &mut []).await?;
+                inner
+                    .data_in_with_retry(
+                        &device_handle.dev_info(),
+                        device_handle.address(),
+                        0,
+                        DataTog::DATA1,
+                        &mut [],
+                    )
+                    .await?;
             }
             RequestTypeDirection::DeviceToHost => {
-                inner.data_out_with_retry(0, DataTog::DATA1, &[]).await?;
+                inner
+                    .data_out_with_retry(
+                        &device_handle.dev_info(),
+                        device_handle.address(),
+                        0,
+                        DataTog::DATA1,
+                        &[],
+                    )
+                    .await?;
             }
         }
 
