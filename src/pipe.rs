@@ -19,7 +19,7 @@ pub trait Pipe {
     fn set_addr(&mut self, addr: u8);
     /// When setup is called, it should send a setup request, also setup the
     /// hardware to send / expect DATA1 packets on subsequent data_in / data_out
-    async fn setup(&mut self, buf: &[u8]) -> Result<(), UsbHostError>;
+    async fn setup(&mut self, buf: Option<&[u8; 8]>) -> Result<(), UsbHostError>;
 
     // TODO: fix ep_type to a proper type
     // msb: lsb
@@ -62,12 +62,9 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
             self.pipe
                 .split(false, tt_port, /* control ep type */ 0x00)
                 .await?;
-            let setup_fut = self.pipe.setup(unsafe {
-                core::slice::from_raw_parts(
-                    core::mem::transmute::<&Request, *const u8>(req),
-                    core::mem::size_of::<Request>(),
-                )
-            });
+            let setup_fut = self.pipe.setup(Some(unsafe {
+                core::mem::transmute::<&Request, &[u8; 8]>(req)
+            }));
             match setup_fut.await {
                 Ok(()) => break,
                 Err(UsbHostError::NAK) => {
@@ -84,7 +81,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
             self.pipe
                 .split(true, tt_port, /* control ep type */ 0x00)
                 .await?;
-            let setup_fut = self.pipe.setup(&[]);
+            let setup_fut = self.pipe.setup(None);
             match setup_fut.await {
                 Ok(()) => break,
                 Err(UsbHostError::NYET) => {
@@ -111,12 +108,9 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
             return self.split_setup(tt_addr, tt_port, address, req).await;
         }
         self.pipe.set_addr(address);
-        let setup_fut = self.pipe.setup(unsafe {
-            core::slice::from_raw_parts(
-                core::mem::transmute::<&Request, *const u8>(req),
-                core::mem::size_of::<Request>(),
-            )
-        });
+        let setup_fut = self.pipe.setup(Some(unsafe {
+            core::mem::transmute::<&Request, &[u8; 8]>(req)
+        }));
         match select(timeout_fut, setup_fut).await {
             Either::First(_) => Err(UsbHostError::TransferTimeout),
             Either::Second(r) => r,
