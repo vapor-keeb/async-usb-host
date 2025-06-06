@@ -273,3 +273,12 @@ impl DevInfo {
         self.speed
     }
 }
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EndpointType {
+    Control = 0x0,
+    Isochronous = 0x1,
+    Bulk = 0x2,
+    Interrupt = 0x3,
+}
