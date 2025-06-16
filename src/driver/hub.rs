@@ -127,7 +127,7 @@ impl Hub {
                     configuration_descriptor.length
                 }
                 Descriptor::Endpoint(endpoint_descriptor) => {
-                    assert!(endpoint_address.is_none());
+                    assert!(endpoint_address.is_none()); // TODO: this happens on the Anker hub
                     endpoint_address = Some(endpoint_descriptor.into());
                     endpoint_descriptor.b_length
                 }

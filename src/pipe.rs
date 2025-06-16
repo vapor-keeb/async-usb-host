@@ -38,6 +38,7 @@ pub trait Pipe {
         endpoint: u8,
         tog: DataTog,
         wait_for_reply: bool,
+        send_ack: bool,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError>;
     async fn data_out(
@@ -177,7 +178,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                     .split(false, tt_port, endpoint_type, speed)
                     .await?;
                 self.pipe.set_addr(address);
-                let in_fut = self.pipe.data_in(endpoint, tog, wait_for_reply, &mut []);
+                let in_fut = self.pipe.data_in(endpoint, tog, wait_for_reply, true, &mut []);
 
                 match in_fut.await {
                     Ok(_) => {
@@ -192,20 +193,33 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                 }
             }
 
+            let mut csplit_count = 0;
+
             // Do the csplit, retry on NYET
             loop {
                 self.pipe.set_addr(tt_addr);
                 self.pipe.split(true, tt_port, endpoint_type, speed).await?;
                 self.pipe.set_addr(address);
-                let in_fut = self.pipe.data_in(endpoint, tog, true, buf);
+                let in_fut = self.pipe.data_in(endpoint, tog, true, false, buf);
                 match in_fut.await {
-                    Ok(size) => return Ok(size),
+                    Ok(size) => {
+                        return Ok(size)
+                    },
                     Err(UsbHostError::NYET) => {
-                        //TODO: this is a hack, fix, NYET probably means we are trying the
-                        // interrupt transfer too fast. According to the spec, we should retry
-                        // ssplit for up to 3 times, if not then abort
-                        if endpoint_type == EndpointType::Interrupt {
-                            break
+                        // TODO:
+                        // I don't understand the spec here. Windows + WCH both does retry of the CSPLIt
+                        // But from what I can tell by reading the spec, it should be a retry of SSPLIT,
+                        // because we should be "last" since we are expecting either a brief report or NAK.
+                        // It seems like that I am understanding "last" incorrectly. We also retry the SSPLIT
+                        // on failure, because it seems like sometimes the TT does not actually process the
+                        // SSPLIT, causing us to retry the CSPLIT indefinitely.
+                        // if endpoint_type == EndpointType::Interrupt {
+                        // Maybe do something speical? consider the spec draw these differently
+                        // }
+                        Timer::after_micros(20).await;
+                        csplit_count += 1;
+                        if csplit_count >= 5 {
+                            break;
                         }
                         continue;
                     }
@@ -246,7 +260,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                 Either::Second(r) => r,
             }
         } else {
-            let fut = self.pipe.data_in(endpoint, tog, true, buf);
+            let fut = self.pipe.data_in(endpoint, tog, true, true, buf);
             match select(timeout_fut, fut).await {
                 Either::First(_) => Err(UsbHostError::TransferTimeout),
                 Either::Second(r) => r,

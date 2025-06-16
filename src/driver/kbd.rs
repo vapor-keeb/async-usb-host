@@ -1,7 +1,10 @@
+use embassy_time::Timer;
+
 use crate::{
     descriptor::{DeviceDescriptor, ParsingError},
     errors::UsbHostError,
     pipe::USBHostPipe,
+    request::{Request, RequestType, RequestTypeDirection, RequestTypeRecipient, RequestTypeType},
     types::{DataTog, EndpointAddress, EndpointDirection, InterruptChannel},
     DeviceHandle, HostDriver,
 };
@@ -95,7 +98,10 @@ impl HidKbd {
         }
     }
 
-    async fn configure<D: HostDriver, const NR_DEVICES: usize>(&mut self, pipe: &USBHostPipe<D, NR_DEVICES>) -> Result<(), UsbHostError> {
+    async fn configure<D: HostDriver, const NR_DEVICES: usize>(
+        &mut self,
+        pipe: &USBHostPipe<D, NR_DEVICES>,
+    ) -> Result<(), UsbHostError> {
         // Pull Configuration Descriptor
         let mut buf: [u8; 255] = [0; 255];
         let len = pipe
@@ -121,13 +127,12 @@ impl HidKbd {
         );
 
         // Set configuration
-        pipe
-            .control_transfer(
-                self.device,
-                &crate::request::Request::set_configuration(cfg.value),
-                &mut [],
-            )
-            .await?;
+        pipe.control_transfer(
+            self.device,
+            &crate::request::Request::set_configuration(cfg.value),
+            &mut [],
+        )
+        .await?;
         trace!("set configuration");
 
         // Get full configuration descriptor with interfaces and endpoints
@@ -164,7 +169,10 @@ impl HidKbd {
                     if !cfg_buf.is_empty() {
                         let desc_len = cfg_buf[0] as usize;
                         if desc_len > 0 && desc_len <= cfg_buf.len() {
-                            debug!("Skipping unknown descriptor of length {} and type {}", desc_len, descriptor_type);
+                            debug!(
+                                "Skipping unknown descriptor of length {} and type {}",
+                                desc_len, descriptor_type
+                            );
                             cfg_buf = &cfg_buf[desc_len..];
                             continue;
                         }
@@ -207,6 +215,25 @@ impl HidKbd {
 
             cfg_buf = &cfg_buf[desc_len..];
         }
+
+        // Send SET_IDLE request to disable automatic repeat
+        let set_idle_request = Request {
+            request_type: {
+                let mut r = RequestType::default();
+                r.set_data_direction(RequestTypeDirection::HostToDevice);
+                r.set_type(RequestTypeType::Class);
+                r.set_recipient(RequestTypeRecipient::Interface);
+                r
+            },
+            request: 0x0A, // SET_IDLE
+            value: 0,      // 0 = disable idle
+            index: 0,      // interface number
+            length: 0,
+        };
+
+        pipe.control_transfer(self.device, &set_idle_request, &mut [])
+            .await?;
+        debug!("SET_IDLE request sent successfully");
 
         if let Some(addr) = endpoint_address {
             // Create an InterruptChannel instead of just storing the endpoint address
@@ -256,7 +283,7 @@ impl USBHostDeviceDriver for HidKbd {
 
     async fn run<'a, D: HostDriver, const NR_DEVICES: usize>(
         self,
-        pipe: &'a USBHostPipe<D, NR_DEVICES>
+        pipe: &'a USBHostPipe<D, NR_DEVICES>,
     ) -> Result<(), UsbHostError> {
         let mut prev_report = [0u8; 8];
         let mut buf = [0u8; 8]; // Standard HID keyboard report is 8 bytes
@@ -270,6 +297,7 @@ impl USBHostDeviceDriver for HidKbd {
         let mut interrupt_channel = interrupt_channel.ok_or(UsbHostError::InvalidState)?;
 
         loop {
+            Timer::after_millis(10).await;
             // Poll the interrupt endpoint for keyboard reports
             match pipe
                 .interrupt_transfer(&mut interrupt_channel, &mut buf)
@@ -290,5 +318,4 @@ impl USBHostDeviceDriver for HidKbd {
             }
         }
     }
-
 }
