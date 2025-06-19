@@ -11,6 +11,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channe
 
 pub(crate) mod hub;
 pub mod kbd;
+pub mod dfu;
 
 pub type DeviceChannel = Channel<CriticalSectionRawMutex, (DeviceHandle, DeviceDescriptor), 1>;
 
@@ -92,7 +93,7 @@ impl<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize>
                     }
                 }
                 Err(e) => {
-                    error!("Failed to attach keyboard: {}", e);
+                    error!("Failed to attach device driver: {}", e);
                 }
             }
         }
