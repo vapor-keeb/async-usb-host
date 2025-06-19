@@ -41,10 +41,12 @@ pub trait Pipe {
         send_ack: bool,
         buf: &mut [u8],
     ) -> Result<usize, UsbHostError>;
+
     async fn data_out(
         &mut self,
         endpoint: u8,
         tog: DataTog,
+        wait_for_reply: bool,
         buf: Option<&[u8]>,
     ) -> Result<(), UsbHostError>;
 }
@@ -178,7 +180,9 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                     .split(false, tt_port, endpoint_type, speed)
                     .await?;
                 self.pipe.set_addr(address);
-                let in_fut = self.pipe.data_in(endpoint, tog, wait_for_reply, true, &mut []);
+                let in_fut = self
+                    .pipe
+                    .data_in(endpoint, tog, wait_for_reply, true, &mut []);
 
                 match in_fut.await {
                     Ok(_) => {
@@ -202,9 +206,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                 self.pipe.set_addr(address);
                 let in_fut = self.pipe.data_in(endpoint, tog, true, false, buf);
                 match in_fut.await {
-                    Ok(size) => {
-                        return Ok(size)
-                    },
+                    Ok(size) => return Ok(size),
                     Err(UsbHostError::NYET) => {
                         // TODO:
                         // I don't understand the spec here. Windows + WCH both does retry of the CSPLIt
@@ -304,44 +306,61 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
         tog: DataTog,
         buf: &[u8],
     ) -> Result<(), UsbHostError> {
-        loop {
-            self.pipe.set_addr(tt_addr);
-            // TODO: this is a huge problem, fix
-            self.pipe
-                .split(false, tt_port, endpoint_type, speed)
-                .await?;
-            self.pipe.set_addr(address);
-            let in_fut = self.pipe.data_out(endpoint, tog, Some(buf));
+        let wait_for_reply = match endpoint_type {
+            EndpointType::Control => true,
+            EndpointType::Interrupt => false,
+            _ => todo!(),
+        };
 
-            match in_fut.await {
-                Ok(_) => {
-                    break;
+        for _ in 0..3 {
+            loop {
+                self.pipe.set_addr(tt_addr);
+                // TODO: this is a huge problem, fix
+                self.pipe
+                    .split(false, tt_port, endpoint_type, speed)
+                    .await?;
+                self.pipe.set_addr(address);
+                let in_fut = self.pipe.data_out(endpoint, tog, wait_for_reply, Some(buf));
+
+                match in_fut.await {
+                    Ok(_) => {
+                        break;
+                    }
+                    Err(UsbHostError::NAK) => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
-                Err(UsbHostError::NAK) => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e);
+            }
+
+            let mut csplit_count = 0;
+
+            // Do the csplit, retry on NYET
+            loop {
+                self.pipe.set_addr(tt_addr);
+                self.pipe.split(true, tt_port, endpoint_type, speed).await?;
+                self.pipe.set_addr(address);
+                let in_fut = self.pipe.data_out(endpoint, tog, true, None);
+                match in_fut.await {
+                    Ok(size) => return Ok(size),
+                    Err(UsbHostError::NYET) => {
+                        Timer::after_micros(20).await;
+                        csplit_count += 1;
+                        if csplit_count >= 5 {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
             }
         }
-
-        // Do the csplit, retry on NYET
-        loop {
-            self.pipe.set_addr(tt_addr);
-            self.pipe.split(true, tt_port, endpoint_type, speed).await?;
-            self.pipe.set_addr(address);
-            let in_fut = self.pipe.data_out(endpoint, tog, None);
-            match in_fut.await {
-                Ok(size) => return Ok(size),
-                Err(UsbHostError::NYET) => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
+        // If 3 retry failed, return stall
+        Err(UsbHostError::STALL)
     }
 
     async fn data_out(
@@ -370,7 +389,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipeInner<D, NR_DEVICES> {
                 Either::Second(r) => r,
             }
         } else {
-            let fut = self.pipe.data_out(endpoint, tog, Some(buf));
+            let fut = self.pipe.data_out(endpoint, tog, true, Some(buf));
             match select(timeout_fut, fut).await {
                 Either::First(_) => Err(UsbHostError::TransferTimeout),
                 Either::Second(r) => r,
