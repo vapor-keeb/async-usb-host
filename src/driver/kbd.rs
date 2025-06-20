@@ -2,6 +2,7 @@ use embassy_time::Timer;
 
 use crate::{
     descriptor::{DeviceDescriptor, ParsingError},
+    driver::get_configuration_descriptor,
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestType, RequestTypeDirection, RequestTypeRecipient, RequestTypeType},
@@ -104,102 +105,33 @@ impl HidKbd {
     ) -> Result<(), UsbHostError> {
         // Pull Configuration Descriptor
         let mut buf: [u8; 255] = [0; 255];
-        let len = pipe
-            .control_transfer(
-                self.device,
-                &crate::request::Request::get_configuration_descriptor(
-                    0,
-                    core::mem::size_of::<crate::descriptor::ConfigurationDescriptor>() as u16,
-                ),
-                &mut buf,
-            )
-            .await?;
 
-        // Fetch a partial configuration descriptor first to get the total length
-        let cfg = crate::descriptor::parse_descriptor(&buf[..len])
-            .and_then(|desc| desc.configuration().ok_or(UsbHostError::InvalidResponse))?
-            .clone();
-
-        trace!(
-            "HID keyboard configuration received {} bytes: {:?}",
-            len,
-            cfg
-        );
-
-        // Set configuration
-        pipe.control_transfer(
-            self.device,
-            &crate::request::Request::set_configuration(cfg.value),
-            &mut [],
-        )
-        .await?;
-        trace!("set configuration");
-
-        // Get full configuration descriptor with interfaces and endpoints
-        let len = pipe
-            .control_transfer(
-                self.device,
-                &crate::request::Request::get_configuration_descriptor(0, cfg.total_length),
-                &mut buf,
-            )
-            .await?;
-        trace!("get configuration descriptor (full) {} bytes", len);
-        // Parse the configuration descriptor to find the interrupt endpoint
-        let mut cfg_buf = &buf[..len];
+        let config_iter = get_configuration_descriptor(self.device, &mut buf, pipe).await?;
         let mut endpoint_address = None;
 
-        while !cfg_buf.is_empty() {
-            let desc = match crate::descriptor::parse_descriptor(cfg_buf) {
-                Ok(desc) => desc,
-                Err(UsbHostError::ParsingError(ParsingError::UnknownType(descriptor_type))) => {
-                    // Check if this is a HID descriptor
-                    if descriptor_type == crate::descriptor::hid::HID_DESCRIPTOR_TYPE {
-                        if let Some(hid_desc) =
-                            crate::descriptor::hid::HIDDescriptor::parse(cfg_buf)
-                        {
-                            trace!("Found HID descriptor: {:?}", hid_desc);
-                            // Skip this descriptor and continue parsing
-                            cfg_buf = &cfg_buf[hid_desc.total_length as usize..];
-                            continue;
-                        }
-                    }
-
-                    // If we can't parse it as a HID descriptor, skip this descriptor
-                    // Assuming the first byte contains the descriptor length
-                    if !cfg_buf.is_empty() {
-                        let desc_len = cfg_buf[0] as usize;
-                        if desc_len > 0 && desc_len <= cfg_buf.len() {
-                            debug!(
-                                "Skipping unknown descriptor of length {} and type {}",
-                                desc_len, descriptor_type
-                            );
-                            cfg_buf = &cfg_buf[desc_len..];
-                            continue;
-                        }
-                    }
-
-                    return Err(UsbHostError::ParsingError(ParsingError::UnknownType(
-                        descriptor_type,
-                    )));
-                }
-                Err(e) => return Err(e),
-            };
-            let desc_len = match desc {
-                crate::descriptor::Descriptor::Device(_) => return Err(UsbHostError::InvalidState),
+        for desc in config_iter {
+            match desc? {
+                crate::descriptor::Descriptor::Device(_device_descriptor) => todo!(),
                 crate::descriptor::Descriptor::Configuration(configuration_descriptor) => {
-                    configuration_descriptor.length
+                    // Set configuration
+                    pipe.control_transfer(
+                        self.device,
+                        &crate::request::Request::set_configuration(configuration_descriptor.value),
+                        &mut [],
+                    )
+                    .await?;
+                    trace!("set configuration");
                 }
                 crate::descriptor::Descriptor::Endpoint(endpoint_descriptor) => {
+                    // TODO: handle multiple endpoints
                     // For HID keyboard, we're looking for an IN interrupt endpoint
                     if endpoint_address.is_none()
                         && (endpoint_descriptor.b_endpoint_address & 0x80) != 0
                     {
                         endpoint_address = Some(endpoint_descriptor.b_endpoint_address);
                     }
-                    endpoint_descriptor.b_length
                 }
                 crate::descriptor::Descriptor::Interface(interface_descriptor) => {
-                    debug!("Found interface: {:?}", interface_descriptor);
                     // Verify this is a HID keyboard interface (class 3, subclass 1, protocol 1)
                     if interface_descriptor.b_interface_class == 0x03
                         && interface_descriptor.b_interface_sub_class == 0x01
@@ -209,11 +141,20 @@ impl HidKbd {
                     } else {
                         debug!("Found non-HID keyboard interface");
                     }
-                    interface_descriptor.b_length
                 }
-            } as usize;
-
-            cfg_buf = &cfg_buf[desc_len..];
+                crate::descriptor::Descriptor::UnknownDescriptor {
+                    descriptor_type,
+                    length: _,
+                    data,
+                } => {
+                    if descriptor_type == crate::descriptor::hid::HID_DESCRIPTOR_TYPE {
+                        if let Some(hid_desc) = crate::descriptor::hid::HIDDescriptor::parse(data) {
+                            trace!("Found HID descriptor: {:?}", hid_desc);
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         // Send SET_IDLE request to disable automatic repeat

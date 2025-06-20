@@ -1,22 +1,31 @@
 /// USB Hub class driver, private because it is only used by the main driver.
 ///
-use core::{future::Future, marker::PhantomData, pin::pin};
+use core::{error, future::Future, marker::PhantomData, pin::pin};
 
 use crate::{
-    descriptor::DeviceDescriptor, driver::kbd::HidKbd, errors::UsbHostError,
-    futures::StaticUnpinPoller, pipe::USBHostPipe, DeviceHandle, HostDriver,
+    descriptor::{Descriptor, DescriptorIterator, DeviceDescriptor},
+    driver::kbd::HidKbd,
+    errors::UsbHostError,
+    futures::StaticUnpinPoller,
+    pipe::USBHostPipe,
+    DeviceHandle, HostDriver,
 };
 use embassy_futures::select::{select, Either};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 
+pub mod dfu;
 pub(crate) mod hub;
 pub mod kbd;
-pub mod dfu;
 
 pub type DeviceChannel = Channel<CriticalSectionRawMutex, (DeviceHandle, DeviceDescriptor), 1>;
 
 #[allow(async_fn_in_trait)]
 pub trait USBHostDeviceDriver: Sized {
+    const CLASS: Option<u8> = None;
+    const SUBCLASS: Option<u8> = None;
+    const VENDOR: Option<u16> = None;
+    const PRODUCT: Option<u16> = None;
+
     async fn try_attach<D: HostDriver, const NR_DEVICES: usize>(
         pipe: &USBHostPipe<D, NR_DEVICES>,
         device: DeviceHandle,
@@ -96,6 +105,49 @@ impl<'a, HDD: USBHostDeviceDriver, HD: HostDriver, const NR_DEVICES: usize>
                     error!("Failed to attach device driver: {}", e);
                 }
             }
+        }
+    }
+}
+
+pub async fn get_configuration_descriptor<'a, HD: HostDriver, const NR_DEVICES: usize>(
+    device_handle: DeviceHandle,
+    buf: &'a mut [u8],
+    pipe: &USBHostPipe<HD, NR_DEVICES>,
+) -> Result<impl Iterator<Item = Result<Descriptor<'a>, UsbHostError>> + 'a, UsbHostError> {
+    let len = pipe
+        .control_transfer(
+            device_handle,
+            &crate::request::Request::get_configuration_descriptor(
+                // TODO: take an index for configuration
+                0,
+                buf.len() as u16,
+            ),
+            buf,
+        )
+        .await?;
+    let buf_len = buf.len();
+
+    let mut iter = DescriptorIterator::new(&mut buf[..len]).peekable();
+    match iter.peek() {
+        Some(Ok(Descriptor::Configuration(c))) => {
+            if c.total_length as usize == len {
+                // If the total length matches, we can return the iterator
+                Ok(iter)
+            } else if buf_len < c.total_length as usize {
+                Err(UsbHostError::BufferOverflow)
+            } else {
+                error!("Configuration descriptor length mismatch: expected {}, got {}", {c.total_length}, len);
+                Ok(iter)
+            }
+        }
+        Some(Ok(_)) => {
+            Err(UsbHostError::InvalidResponse)
+        }
+        Some(Err(e)) => {
+            Err(e.clone())
+        }
+        None => {
+            Err(UsbHostError::InvalidResponse)
         }
     }
 }

@@ -3,7 +3,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Timer;
 
 use crate::{
-    descriptor::{parse_descriptor, DeviceDescriptor},
+    descriptor::{DescriptorIterator, DeviceDescriptor},
     device_addr::DeviceDisconnectMask,
     errors::UsbHostError,
     request::{self, Request, StandardDeviceRequest},
@@ -464,11 +464,11 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
     }
 
     // TODO: maybe take a address, technically we can do this after enumeration
-    async fn get_device_descriptor<'b>(
+    async fn get_device_descriptor(
         &self,
         dev_info: &DevInfo,
-        buf: &'b mut [u8],
-    ) -> Result<&'b DeviceDescriptor, UsbHostError> {
+        buf: &mut [u8],
+    ) -> Result<DeviceDescriptor, UsbHostError> {
         debug_assert!(buf.len() >= 18);
         let mut inner = self.inner.lock().await;
         // Setup Stage
@@ -524,9 +524,12 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             .await?;
 
         debug_assert!(bytes_read == core::mem::size_of::<DeviceDescriptor>());
-        let dev_desc = parse_descriptor(buf)
-            .and_then(|desc| desc.device().ok_or(UsbHostError::InvalidResponse))?;
-        Ok(dev_desc)
+        let mut desc_iter = DescriptorIterator::new(&buf[..bytes_read]);
+
+        desc_iter
+            .next()
+            .ok_or(UsbHostError::InvalidResponse)?
+            .and_then(|desc| desc.device().cloned().ok_or(UsbHostError::InvalidResponse))
     }
 
     pub async fn interrupt_transfer(
@@ -662,7 +665,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
             .await?;
         trace!("Device addressed {}", handle.address());
 
-        Ok((d.clone(), handle))
+        Ok((d, handle))
     }
 
     pub async fn root_detach(&self) -> DeviceDisconnectMask {

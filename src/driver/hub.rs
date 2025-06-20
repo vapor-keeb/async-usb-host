@@ -3,8 +3,9 @@ use bitvec::{array::BitArray, BitArr};
 use crate::{
     descriptor::{
         hub::{HubDescriptor, HubPortFeature, HubPortStatus, HubPortStatusChange},
-        parse_descriptor, ConfigurationDescriptor, Descriptor, DeviceDescriptor,
+        ConfigurationDescriptor, Descriptor, DeviceDescriptor,
     },
+    driver::get_configuration_descriptor,
     errors::UsbHostError,
     pipe::USBHostPipe,
     request::{Request, RequestTypeRecipient, RequestTypeType},
@@ -31,26 +32,26 @@ impl Hub {
         handle: DeviceHandle,
         _descriptor: DeviceDescriptor, // TODO: maybe check if this is a hub?
     ) -> Result<Self, UsbHostError> {
-        // Pull Configuraiton Descriptor
+        // Pull uConfiguraiton Descriptor
         let mut buf: [u8; 255] = [0; 255];
-        let len = unwrap!(
-            pipe.control_transfer(
-                handle,
-                &Request::get_configuration_descriptor(
-                    0,
-                    core::mem::size_of::<ConfigurationDescriptor>() as u16
-                ),
-                &mut buf,
-            )
-            .await
-        );
-        let cfg = parse_descriptor(&buf[..len])
-            .and_then(|desc| desc.configuration().ok_or(UsbHostError::InvalidResponse))?
-            .clone();
-        trace!("configuration recv {} bytes: {:?}", len, cfg);
+        let desc_iter = get_configuration_descriptor(handle, &mut buf, pipe).await?;
+
+        let mut endpoint_address = None;
+        for desc in desc_iter {
+            match desc? {
+                Descriptor::Configuration(cfg) => {
+                    pipe.control_transfer(handle, &Request::set_configuration(cfg.value), &mut [])
+                        .await?;
+                    debug!("found hub configuration: {:?}", cfg);
+                }
+                Descriptor::Endpoint(endpoint_descriptor) => {
+                    assert!(endpoint_address.is_none()); // TODO: this happens on the Anker hub
+                    endpoint_address = Some(endpoint_descriptor.into());
+                }
+                _ => continue, // skip other descriptors
+            }
+        }
         // set config
-        pipe.control_transfer(handle, &Request::set_configuration(cfg.value), &mut [])
-            .await?;
 
         let mut hub_desc = HubDescriptor::default();
         let hub_desc_buf = unsafe {
@@ -104,37 +105,6 @@ impl Hub {
                 &mut port_status,
             )
             .await?;
-        }
-
-        // get configuration descriptor again with the proper len
-        let len = unwrap!(
-            pipe.control_transfer(
-                handle,
-                &Request::get_configuration_descriptor(0, cfg.total_length),
-                &mut buf,
-            )
-            .await
-        );
-
-        // TODO should probably iterate through the descriptor
-        let mut cfg_buf = &buf[..len];
-        let mut endpoint_address = None;
-        while !cfg_buf.is_empty() {
-            let desc = parse_descriptor(cfg_buf)?;
-            let len = match desc {
-                Descriptor::Device(_) => return Err(UsbHostError::InvalidState),
-                Descriptor::Configuration(configuration_descriptor) => {
-                    configuration_descriptor.length
-                }
-                Descriptor::Endpoint(endpoint_descriptor) => {
-                    assert!(endpoint_address.is_none()); // TODO: this happens on the Anker hub
-                    endpoint_address = Some(endpoint_descriptor.into());
-                    endpoint_descriptor.b_length
-                }
-                Descriptor::Interface(interface_descriptor) => interface_descriptor.b_length,
-            } as usize;
-
-            cfg_buf = &cfg_buf[len..];
         }
 
         let endpoint_address = endpoint_address.ok_or(UsbHostError::InvalidResponse)?;
