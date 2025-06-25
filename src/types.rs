@@ -3,7 +3,7 @@ use crate::{descriptor::EndpointDescriptor, DeviceHandle};
 /// Represents a 16-bit binary-coded-decimal value
 ///
 /// A 16-bit BCD represents 4 decimal digits (0-9).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(not(feature = "defmt"), derive(Debug))]
 #[repr(transparent)]
 pub struct Bcd16(pub u16);
@@ -26,6 +26,10 @@ impl Bcd16 {
             && (value >> 8 & 0xF) < 10
             && (value >> 4 & 0xF) < 10
             && (value & 0xF) < 10
+    }
+
+    pub(crate) fn from_le_bytes(data: [u8; 2]) -> Bcd16 {
+        Bcd16(u16::from_le_bytes(data))
     }
 }
 
