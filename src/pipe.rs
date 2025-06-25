@@ -579,7 +579,7 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         &self,
         device_handle: DeviceHandle,
         request: &Request,
-        buffer: &mut [u8],
+        mut buffer: &mut [u8],
     ) -> Result<usize, UsbHostError> {
         use request::RequestTypeDirection;
         let mut inner = self.inner.lock().await;
@@ -596,7 +596,25 @@ impl<D: HostDriver, const NR_DEVICES: usize> USBHostPipe<D, NR_DEVICES> {
         // (Optional) data stage
         if request.length > 0 {
             match dir {
-                RequestTypeDirection::HostToDevice => todo!(),
+                RequestTypeDirection::HostToDevice => {
+                    let mut tog = DataTog::DATA1;
+                    while !buffer.is_empty() {
+                        let transfer_len =
+                            core::cmp::min(buffer.len(), device_handle.max_packet_size() as usize);
+                        inner
+                            .data_out_with_retry(
+                                &device_handle.dev_info(),
+                                device_handle.address(),
+                                0,
+                                EndpointType::Control,
+                                tog,
+                                &buffer[..transfer_len],
+                            )
+                            .await?;
+                        tog.next();
+                        buffer = &mut buffer[transfer_len..];
+                    }
+                }
                 RequestTypeDirection::DeviceToHost => {
                     let mut tog = DataTog::DATA1;
                     loop {

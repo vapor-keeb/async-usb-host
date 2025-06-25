@@ -1,4 +1,9 @@
-use usb_dfu_target::consts::{State, DFU_PROTOCOL_RT, USB_CLASS_APPN_SPEC};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    channel::{self, Channel, Receiver, Sender},
+    pipe::Writer,
+};
+use usb_dfu_target::consts::{DfuRequest, State, DFU_PROTOCOL_RT, USB_CLASS_APPN_SPEC};
 
 use crate::{
     descriptor::{Descriptor, DeviceDescriptor},
@@ -9,7 +14,14 @@ use crate::{
     DeviceHandle,
 };
 
-use super::get_configuration_descriptor;
+use super::{get_configuration_descriptor, DeviceChannel};
+
+pub enum DFUOperation {
+    StartDownload,
+    Bytes([u8; 8]),
+    Manifest,
+    Detach,
+}
 
 #[derive(Default, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -47,9 +59,21 @@ impl DFUCapabilities {
     }
 }
 
+static DFU_CHANNEL: Channel<CriticalSectionRawMutex, DFUOperation, 1> = Channel::new();
+
 pub struct UsbDfu {
     pub device: DeviceHandle,
     info: DFUInfo,
+}
+
+impl UsbDfu {
+    pub fn channel_sender() -> Sender<'static, CriticalSectionRawMutex, DFUOperation, 1> {
+        DFU_CHANNEL.sender()
+    }
+
+    fn channel_receiver(&self) -> Receiver<'static, CriticalSectionRawMutex, DFUOperation, 1> {
+        DFU_CHANNEL.receiver()
+    }
 }
 
 impl USBHostDeviceDriver for UsbDfu {
@@ -124,7 +148,7 @@ impl USBHostDeviceDriver for UsbDfu {
     ) -> Result<(), crate::errors::UsbHostError> {
         let device_handle = self.device;
         let mut buffer = [0u8; 64];
-        let request = Request {
+        let dfu_get_state = Request {
             request_type: {
                 let mut t = crate::request::RequestType::default();
                 t.set_data_direction(crate::request::RequestTypeDirection::DeviceToHost);
@@ -137,9 +161,59 @@ impl USBHostDeviceDriver for UsbDfu {
             index: 0,
             length: 1,
         };
-        pipe.control_transfer(device_handle, &request, &mut buffer)
+        pipe.control_transfer(device_handle, &dfu_get_state, &mut buffer)
             .await?;
         trace!("DFU device attached, state: {:?}", buffer[0]);
-        Ok(())
+        let channel_receiver = self.channel_receiver();
+        let mut dfu_block_counter = 0u16;
+        loop {
+            let dfu_op = channel_receiver.receive().await;
+            match dfu_op {
+                DFUOperation::StartDownload => {
+                    trace!("Starting download");
+                    dfu_block_counter = 0;
+                }
+                DFUOperation::Bytes(mut bytes) => {
+                    for _ in 0..3 {
+                        let dfu_download = Request {
+                            request_type: {
+                                let mut t = crate::request::RequestType::default();
+                                t.set_type(crate::request::RequestTypeType::Class);
+                                t.set_recipient(crate::request::RequestTypeRecipient::Interface);
+                                t.set_data_direction(
+                                    crate::request::RequestTypeDirection::HostToDevice,
+                                );
+                                t
+                            },
+                            request: DfuRequest::Dnload as u8,
+                            value: dfu_block_counter,
+                            index: 0,
+                            length: 8,
+                        };
+                        trace!("sending ctrl transfer to do DFU");
+                        match pipe
+                            .control_transfer(device_handle, &dfu_download, &mut bytes)
+                            .await
+                        {
+                            Ok(_) => {
+                                info!("Downloaded block {:?}", dfu_block_counter);
+                                dfu_block_counter = dfu_block_counter.wrapping_add(1);
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Error downloading bytes: {:?}", e);
+                            }
+                        }
+                    }
+                }
+                DFUOperation::Manifest => {
+                    trace!("Received manifest");
+                }
+                DFUOperation::Detach => {
+                    trace!("Detaching");
+                    return Ok(());
+                }
+            }
+        }
     }
 }
