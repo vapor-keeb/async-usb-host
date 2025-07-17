@@ -90,7 +90,6 @@ impl<Fut1: Future, Fut2: Future> SelectPin2<Fut1, Fut2> {
     ///
     /// # Safety
     /// Caller must ensure `self` is pinned and the slot `index` is `Occupied`.
-    #[inline]
     unsafe fn drop_future_at(self: Pin<&mut Self>, index: usize) {
         // Safety: We don't move fields out of `self`.
         let this = self.get_unchecked_mut();
@@ -247,7 +246,6 @@ where
     /// 3. The returned `Pin<&mut F>` points to memory within the pinned `self.storage`,
     ///    and we promise not to move the `F` out of `self.storage[index]` until it's
     ///    dropped via `drop_future_at`.
-    #[inline]
     unsafe fn get_pin_mut(self: Pin<&mut Self>, index: usize) -> Option<Pin<&mut F>> {
         // Get mutable references to storage and states via the pin projection.
         // `Pin::get_unchecked_mut` is safe because we don't move fields out of `self`.
@@ -273,7 +271,6 @@ where
     /// 3. This is called only once for a given occupied future.
     ///
     /// This function transitions the state to `Empty`.
-    #[inline]
     unsafe fn drop_future_at(self: Pin<&mut Self>, index: usize) {
         // Safety: We don't move fields out of `self`.
         let this = self.get_unchecked_mut();
